@@ -137,12 +137,13 @@ class LiteAttention:
         >>> output = lite_attn(query, key, value)
     """
     
-    def __init__(self, enable_skipping: bool = True, threshold: float = -10.0, max_batch_size: int = 2, reverse_skip_list: bool = True, use_int8: bool = False):
+    def __init__(self, enable_skipping: bool = True, threshold: float = -10.0, max_batch_size: int = 2, reverse_skip_list: bool = True, use_int8: bool = False, negl_prob: float = 0.0):
         # Internal skip list management
         self._skip_list = None  # Shape: [2, max_batch_size, heads, qtiles, ktiles+1]
         self._phase = 0  # Alternates between 0 and 1 for double-buffering
         self.reverse_skip_list = reverse_skip_list  # Controls skip list format
         self.use_int8 = use_int8  # Whether using int8 quantization
+        self.negl_prob = negl_prob  # Mass-based skipping (from paper)
         
         # Cache of last tensor properties (used to detect when reinitialization is needed)
         self._last_batch_size = None  # Actual batch size used (not max_batch_size)
@@ -661,7 +662,8 @@ class LiteAttention:
             return query, key, None, None
     
     def __call__(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, 
-                 scale: Optional[float] = None, return_softmax_lse: bool = False, must_do_list: list = None, must_skip_list: list = None) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+                 scale: Optional[float] = None, return_softmax_lse: bool = False, must_do_list: list = None, must_skip_list: list = None,
+                 tile_stats: Optional[torch.Tensor] = None) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Perform Flash Attention 3 computation with optional skip list optimization.
         
@@ -745,6 +747,8 @@ class LiteAttention:
             phase=(self._phase == 1) if self.reverse_skip_list else False,
             q_descale=q_descale,
             k_descale=k_descale,
+            tile_stats=tile_stats,
+            negl_prob=self.negl_prob,
         )
 
         # Calculate and store statistics if enabled

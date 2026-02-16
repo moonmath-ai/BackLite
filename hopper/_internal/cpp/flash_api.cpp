@@ -535,14 +535,35 @@
      return 256;
  }
  
- inline int round_up_headdimv(int head_size) {
-     if (head_size <= 64) { return 64; }
-     if (head_size <= 96) { return 96; }
-     if (head_size <= 128) { return 128; }
-     if (head_size <= 192) { return 192; }
-     if (head_size <= 256) { return 256; }
-     return 512;
- }
+inline int round_up_headdimv(int head_size) {
+    if (head_size <= 64) { return 64; }
+    if (head_size <= 96) { return 96; }
+    if (head_size <= 128) { return 128; }
+    if (head_size <= 192) { return 192; }
+    if (head_size <= 256) { return 256; }
+    return 512;
+}
+
+inline std::tuple<int, int> tile_size_bwd(int arch, int head_size_rounded, bool is_causal, bool is_local, bool has_softcap) {
+    // Must match flash_bwd_launch_template.h dispatch.
+    // SM90 uses kBlockM=64 for hdim >= 96 (including hdim 128).
+    int const kBlockM_sm90 = head_size_rounded <= 64 ? (is_causal && has_softcap ? 96 : 128) : 64;
+    int const kBlockM_sm80 = head_size_rounded <= 64 ? 128 : 64;
+    int const kBlockM_sm86 = head_size_rounded <= 192 ? 64 : 32;
+    int const kBlockM = arch >= 90 ? kBlockM_sm90 : (arch == 86 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
+    int const kBlockN_sm90 = head_size_rounded <= 128
+        ? 128
+        : (head_size_rounded <= 192 ? 96 : 80);
+    int const kBlockN_sm80 = head_size_rounded <= 128
+        ? 128
+        : (head_size_rounded <= 192 ? 80 : 64);
+    int const kBlockN_sm86 = head_size_rounded <= 64 ? 128
+        : (head_size_rounded <= 96 ? 128
+           : (head_size_rounded <= 128 ? 96
+              : (head_size_rounded <= 192 ? 64 : 64)));
+    int const kBlockN = arch >= 90 ? kBlockN_sm90 : (arch == 86 || arch == 89 ? kBlockN_sm86 : kBlockN_sm80);
+    return {kBlockM, kBlockN};
+}
  
  // Only applicable to the case where seqused_k (i.e. cache_seqlens) is available
  at::Tensor
@@ -739,7 +760,8 @@
          std::optional<at::Tensor> attn_write_list_,
          double thr,
          bool reverse_skip_list = false,
-         bool phase = false
+         bool phase = false,
+         std::optional<at::Tensor> tile_stats_ = std::nullopt
      ) {
      // params.reverse_skip_list = reverse_skip_list;
      // params.phase = phase;
@@ -1298,9 +1320,30 @@
      TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
      #endif
  
-     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
-         auto stream = at::cuda::getCurrentCUDAStream().stream();
-         run_mha_fwd(params, stream);
+    // Per-row tile stats: optional tensor of shape (batch, num_heads, seq_q, num_n_blocks), float32 (local tile LSE).
+    if (tile_stats_.has_value()) {
+        auto tile_stats = tile_stats_.value();
+        CHECK_DEVICE(tile_stats);
+        TORCH_CHECK(tile_stats.dtype() == torch::kFloat32, "tile_stats must be float32");
+        TORCH_CHECK(tile_stats.is_contiguous(), "tile_stats must be contiguous");
+        TORCH_CHECK(tile_stats.dim() == 4,
+                    "tile_stats must have shape (batch, num_heads, seq_q_or_m_blocks, num_n_blocks)");
+        params.ptr_tile_stats = tile_stats.data_ptr<float>();
+        params.stride_tile_batch = tile_stats.stride(0);
+        params.stride_tile_head = tile_stats.stride(1);
+        params.stride_tile_m = tile_stats.stride(2);
+        params.stride_tile_n = tile_stats.stride(3);
+    } else {
+        params.ptr_tile_stats = nullptr;
+        params.stride_tile_batch = 0;
+        params.stride_tile_head = 0;
+        params.stride_tile_m = 0;
+        params.stride_tile_n = 0;
+    }
+
+    if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        run_mha_fwd(params, stream);
          if (params.num_splits > 1) {
              if (out_type == at::ScalarType::BFloat16) {
                  // Since we want output in BF16. Otherwise fwd_combine will output to FP16
@@ -1315,13 +1358,13 @@
              //     params.b = 1;
              //     params.seqlen_q = total_q;
              // }
-             // This will zero out the semaphore if needed
-             run_mha_fwd_combine(params, stream, true /*enable_pdl*/);
-         } else if (scheduler_needs_semaphore && params.skip_scheduler_metadata_computation) {
-             // need to zero out the semaphore in this case
-             tile_count_semaphore.index({torch::indexing::Slice(params.tile_count_semaphore_offset, params.tile_count_semaphore_offset + 1)}).zero_();
-         }
-     } else if (total_q > 0 && num_heads_k > 0) {
+            // This will zero out the semaphore if needed
+            run_mha_fwd_combine(params, stream, true /*enable_pdl*/);
+        } else if (scheduler_needs_semaphore && params.skip_scheduler_metadata_computation) {
+            // need to zero out the semaphore in this case
+            tile_count_semaphore.index({torch::indexing::Slice(params.tile_count_semaphore_offset, params.tile_count_semaphore_offset + 1)}).zero_();
+        }
+    } else if (total_q > 0 && num_heads_k > 0) {
          // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
          out.zero_();
          softmax_lse.fill_(std::numeric_limits<float>::infinity());
@@ -1420,7 +1463,8 @@
      int64_t window_size_right,
      double softcap,
      bool deterministic,
-     int64_t sm_margin
+     int64_t sm_margin,
+     std::optional<at::Tensor> block_mask_ = std::nullopt
  ) {
  
      #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -1503,24 +1547,7 @@
      int const head_size_v_rounded = head_size_rounded;
      // Very important that these match the kernel configs
      bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-     int const kBlockM_sm90 = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
-         : (head_size_rounded <= 96 ? 64
-            : (head_size_rounded <= 128 ? (is_causal || is_local || softcap > 0.0 ? 64 : 80)
-               : 64));
-     int const kBlockM_sm80 = head_size_rounded <= 64 ? 128 : 64;
-     int const kBlockM_sm86 = head_size_rounded <= 192 ? 64 : 32;
-     int const kBlockM = arch >= 90 ? kBlockM_sm90 : (arch == 86 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
-     int const kBlockN_sm90 = head_size_rounded <= 128
-         ? 128
-         : (head_size_rounded <= 192 ? 96 : 80);
-     int const kBlockN_sm80 = head_size_rounded <= 128
-         ? 128
-         : (head_size_rounded <= 192 ? 80 : 64);
-     int const kBlockN_sm86 = head_size_rounded <= 64 ? 128
-         : (head_size_rounded <= 96 ? 128
-            : (head_size_rounded <= 128 ? 96
-               : (head_size_rounded <= 192 ? 64 : 64)));
-     int const kBlockN = arch >= 90 ? kBlockN_sm90 : (arch == 86 || arch == 89 ? kBlockN_sm86 : kBlockN_sm80);
+     auto [kBlockM, kBlockN] = tile_size_bwd(arch, head_size_rounded, is_causal, is_local, softcap > 0.0);
      auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
      int const seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
      int const seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);
@@ -1679,13 +1706,31 @@
      #ifdef FLASHATTENTION_DISABLE_LOCAL
      TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
      #endif
-     #ifdef FLASHATTENTION_DISABLE_SOFTCAP
-     TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
-     #endif
- 
-     if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
-         auto stream = at::cuda::getCurrentCUDAStream().stream();
-         run_mha_bwd(params, stream);
+    #ifdef FLASHATTENTION_DISABLE_SOFTCAP
+    TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
+    #endif
+
+    // Set block sparsity mask pointers
+    if (block_mask_.has_value()) {
+        auto block_mask = block_mask_.value();
+        CHECK_DEVICE(block_mask);
+        TORCH_CHECK(block_mask.dtype() == torch::kUInt8, "block_mask must be uint8");
+        TORCH_CHECK(block_mask.is_contiguous(), "block_mask must be contiguous");
+        params.ptr_block_mask = static_cast<uint8_t*>(block_mask.data_ptr());
+        // Calculate num_row_tiles and num_col_tiles from block_mask shape
+        // Expected shape: [batch, head, num_row_tiles, num_col_tiles]
+        TORCH_CHECK(block_mask.dim() == 4, "block_mask must have 4 dimensions [batch, head, num_row_tiles, num_col_tiles]");
+        params.num_row_tiles = block_mask.size(2);
+        params.num_col_tiles = block_mask.size(3);
+    } else {
+        params.ptr_block_mask = nullptr;
+        params.num_row_tiles = 0;
+        params.num_col_tiles = 0;
+    }
+
+    if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        run_mha_bwd(params, stream);
      } else if (total_k > 0 && num_heads_k > 0) {
          // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
          dk.zero_();
@@ -1802,17 +1847,33 @@
      return {out, softmax_lse};
  }
  
- // Wrapper function to expose tile_size_fwd_sm90 to Python
- // Returns [kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap]
- std::vector<int64_t> get_tile_size_fwd_sm90(
-         int64_t headdim, int64_t headdim_v, bool is_causal, bool is_local, int64_t element_size,
-         bool v_colmajor, bool paged_kv_non_TMA, bool softcap, bool is_skipable, bool is_int8) {
+// Wrapper function to expose tile_size_fwd_sm90 to Python
+// Returns [kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap]
+std::vector<int64_t> get_tile_size_fwd_sm90(
+        int64_t headdim, int64_t headdim_v, bool is_causal, bool is_local, int64_t element_size,
+        bool v_colmajor, bool paged_kv_non_TMA, bool softcap, bool is_skipable, bool is_int8) {
      auto [kBlockM, kBlockN, MmaPV_is_RS, IntraWGOverlap] = tile_size_fwd_sm90(
          static_cast<int>(headdim), static_cast<int>(headdim_v), is_causal, is_local, 
          static_cast<int>(element_size), v_colmajor, paged_kv_non_TMA, softcap, is_skipable, is_int8);
-     return {static_cast<int64_t>(kBlockM), static_cast<int64_t>(kBlockN), 
-             static_cast<int64_t>(MmaPV_is_RS), static_cast<int64_t>(IntraWGOverlap)};
- }
+    return {static_cast<int64_t>(kBlockM), static_cast<int64_t>(kBlockN), 
+            static_cast<int64_t>(MmaPV_is_RS), static_cast<int64_t>(IntraWGOverlap)};
+}
+
+// Wrapper function to expose bwd tile-size logic to Python.
+// Returns [kBlockM, kBlockN].
+std::vector<int64_t> get_tile_size_bwd(
+        int64_t headdim, int64_t headdim_v, bool is_causal, bool is_local, bool softcap) {
+    TORCH_CHECK(headdim % 8 == 0, "headdim must be a multiple of 8");
+    TORCH_CHECK(headdim_v % 8 == 0, "headdim_v must be a multiple of 8");
+    int const max_headdim = get_max_headdim();
+    int const head_size_rounded = round_up_headdim(std::max(static_cast<int>(headdim), static_cast<int>(headdim_v)));
+    TORCH_CHECK(head_size_rounded <= max_headdim,
+                "FlashAttention backward only supports head dimension at most " + std::to_string(max_headdim));
+
+    int const arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
+    auto [kBlockM, kBlockN] = tile_size_bwd(arch, head_size_rounded, is_causal, is_local, softcap);
+    return {static_cast<int64_t>(kBlockM), static_cast<int64_t>(kBlockN)};
+}
  
 // Wrapper function for TMA-based Q/K quantization
 // Returns (Q_q, K_q, q_descale, k_descale)
@@ -1945,12 +2006,13 @@ quantize_qk(
          "bool? pack_gqa = None,"
          "int sm_margin = 0,"
          // "Tensor? qk_skip_mask_args = None,"
-         "Tensor? attn_read_list = None,"
-         "Tensor? attn_must_do_list = None,"
-         "Tensor? attn_write_list = None,"
-         "float thr = -3.0,"
-         "bool reverse_skip_list = False,"
-         "bool phase = False) -> (Tensor(out!), Tensor, Tensor, Tensor)"
+        "Tensor? attn_read_list = None,"
+        "Tensor? attn_must_do_list = None,"
+        "Tensor? attn_write_list = None,"
+        "float thr = -3.0,"
+        "bool reverse_skip_list = False,"
+        "bool phase = False,"
+        "Tensor? tile_stats = None) -> (Tensor(out!), Tensor, Tensor, Tensor)"
      );
      m.def("bwd("
          "Tensor dout,"
@@ -1972,9 +2034,10 @@ quantize_qk(
          "bool is_causal = False,"
          "int window_size_left = -1,"
          "int window_size_right = -1,"
-         "float softcap = 0.0,"
-         "bool deterministic = False,"
-         "int sm_margin = 0) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "float softcap = 0.0,"
+        "bool deterministic = False,"
+        "int sm_margin = 0,"
+        "Tensor? block_mask = None) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
      m.def("fwd_combine("
          "Tensor out_partial,"
          "Tensor lse_partial,"
@@ -2016,6 +2079,12 @@ quantize_qk(
          "bool softcap = False,"
          "bool is_skipable = False,"
          "bool is_int8 = False) -> int[]", &get_tile_size_fwd_sm90);
+    m.def("get_tile_size_bwd("
+        "int headdim,"
+        "int headdim_v,"
+        "bool is_causal,"
+        "bool is_local,"
+        "bool softcap = False) -> int[]", &get_tile_size_bwd);
     m.def("quantize_qk("
         "Tensor Q,"
         "Tensor K,"
@@ -2031,4 +2100,3 @@ quantize_qk(
      m.impl("fwd_combine", &mha_combine);
      m.impl("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata);
  }
- 

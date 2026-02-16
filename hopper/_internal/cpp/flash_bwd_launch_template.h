@@ -131,7 +131,11 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.b,
         params.dq_semaphore,
         params.cu_seqlens_q, params.cu_seqlens_k,
-        params.seqused_q, params.seqused_k
+        params.seqused_q, params.seqused_k,
+        // Block sparsity mask
+        params.ptr_block_mask,
+        params.num_row_tiles,
+        params.num_col_tiles
     };
     // The case work with GQA is ugly but idk how to fix it.
     typename CollectiveEpilogue::Arguments epilogue_args {
@@ -349,11 +353,13 @@ template<int Arch, typename T, bool Has_softcap>
 void run_mha_bwd_hdim128(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         if constexpr (Arch >= 90) {
-            if constexpr (Is_causal || Is_local || Has_softcap) {
-                run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1, false>(params, stream);
-            } else {
-                run_mha_bwd_dispatch<Arch, T, 80, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 1, false>(params, stream);
-            }
+            // Use kBlockM=64 for all cases to match mask tile grid
+            run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1, false>(params, stream);
+            // if constexpr (Is_causal || Is_local || Has_softcap) {
+            //     run_mha_bwd_dispatch<Arch, T, 64, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1, false>(params, stream);
+            // } else {
+            //     run_mha_bwd_dispatch<Arch, T, 80, 128, 128, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 1, false>(params, stream);
+            // }
         } else if constexpr (Arch == 86 || Arch == 89) {
             run_mha_bwd_dispatch<Arch, T, 64, 96, 128, Is_causal, Is_local, Has_softcap, 1, 2, false, false, false, 2, 2, 2, 2, true>(params, stream);
         } else {

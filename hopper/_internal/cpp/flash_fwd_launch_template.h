@@ -282,6 +282,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream)
         params.leftpad_k,
         params.seqlens_rotary, // Left padding for K and rotary position lengths
         params.qk_skip_mask_args,
+        // Per-tile stats (local tile LSE) for sparsity masking
+        params.ptr_tile_stats,
+        {params.stride_tile_batch, params.stride_tile_head, params.stride_tile_m, params.stride_tile_n},
     };
     // Construct epilogue arguments for output tensor handling using CuTe abstractions
     typename CollectiveEpilogue::Arguments epilogue_args{

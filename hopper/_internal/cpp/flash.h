@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cuda.h>
+#include <cuda_runtime.h>
 #include <vector>
 
 // #include "softmax.h"
@@ -190,6 +191,13 @@ struct Flash_fwd_params : public Qkv_params
     bool phase = false;
     bool has_must_do_list = false;
     // ~~~~~~~~~~~~~~~~
+    
+    // Per-row tile stats: one float local LSE per (q_row, n_block). Shape: [Batch, Head, SeqQ, N_Block].
+    float *__restrict__ ptr_tile_stats;
+    index_t stride_tile_batch;
+    index_t stride_tile_head;
+    index_t stride_tile_m;
+    index_t stride_tile_n;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -237,6 +245,11 @@ struct Flash_bwd_params : public Flash_fwd_params
 
     bool deterministic;
     index_t dq_accum_split_stride;
+    
+    // Block sparsity mask (backward pass)
+    uint8_t *__restrict__ ptr_block_mask;
+    int num_row_tiles;
+    int num_col_tiles;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
