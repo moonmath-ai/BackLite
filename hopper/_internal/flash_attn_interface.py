@@ -13,6 +13,17 @@ import lite_attention._C # Registers operators with PyTorch
 
 flash_attn_3_cuda = torch.ops.lite_attention
 
+_mask_gen_start_event = None
+_mask_gen_end_event = None
+
+def get_last_mask_gen_time_ms():
+    """Return GPU time (ms) for the last _generate_mask_from_stats_mass call, or None."""
+    global _mask_gen_start_event, _mask_gen_end_event
+    if _mask_gen_start_event is None or _mask_gen_end_event is None:
+        return None
+    _mask_gen_end_event.synchronize()
+    return _mask_gen_start_event.elapsed_time(_mask_gen_end_event)
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -416,11 +427,16 @@ class FlashAttnFunc(torch.autograd.Function):
             if tile_stats is None:
                 raise RuntimeError("tile_stats must be allocated when negl_prob > 0")
             is_local = (window_size[0] >= 0 or window_size[1] >= 0) and not causal
+            global _mask_gen_start_event, _mask_gen_end_event
+            _mask_gen_start_event = torch.cuda.Event(enable_timing=True)
+            _mask_gen_end_event = torch.cuda.Event(enable_timing=True)
+            _mask_gen_start_event.record()
             block_mask = _generate_mask_from_stats_mass(
                 tile_stats, q.shape[1], q.shape[-1], v.shape[-1], q.dtype, negl_prob,
                 is_causal=causal, is_local=is_local, softcap=softcap, device=q.device,
                 softmax_lse=softmax_lse,
             )
+            _mask_gen_end_event.record()
 
         # Save tensors for backward pass
         # If block_mask exists, save it; otherwise don't save it to avoid issues with empty tensors
