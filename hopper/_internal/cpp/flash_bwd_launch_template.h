@@ -185,6 +185,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.seqlen_q, params.d, params.dv, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens_k, params.seqused_k
     };
+    scheduler_args.work_remap = params.work_remap;
 
     int device;
     cudaGetDevice(&device);
@@ -322,8 +323,9 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
                 // register spill with 128 x 128
                 run_mha_bwd_dispatch<Arch, T, 96, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, true, 2, 1, 2, 2, false>(params, stream);
             } else {
-                // With ShuffleStats we no longer have register spilling when Has_softcap and using 128 x 128 block.
-                run_mha_bwd_dispatch<Arch, T, 128, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 2, false>(params, stream);
+                // Use kBlockM=64 to match D=128 mask tile granularity: finer skipping granularity
+                // enables sparse bwd to be beneficial for D=64 too (was 128, caused 2x coarser masking).
+                run_mha_bwd_dispatch<Arch, T, 64, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, true, false, false, 2, 1, 2, 1, false>(params, stream);
             }
         } else if constexpr (Arch == 86 || Arch == 89) {
             run_mha_bwd_dispatch<Arch, T, 64, 128, 64, Is_causal, Is_local, Has_softcap, 2, 2, false, false, false, 2, 2, 4, 2, true>(params, stream);

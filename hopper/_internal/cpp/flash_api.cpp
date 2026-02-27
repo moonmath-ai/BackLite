@@ -546,8 +546,9 @@ inline int round_up_headdimv(int head_size) {
 
 inline std::tuple<int, int> tile_size_bwd(int arch, int head_size_rounded, bool is_causal, bool is_local, bool has_softcap) {
     // Must match flash_bwd_launch_template.h dispatch.
-    // SM90 uses kBlockM=64 for hdim >= 96 (including hdim 128).
-    int const kBlockM_sm90 = head_size_rounded <= 64 ? (is_causal && has_softcap ? 96 : 128) : 64;
+    // SM90 uses kBlockM=64 for all head dims (D=64 was changed from 128->64 to match mask tile
+    // granularity and enable effective sparse backward; only exception is causal+softcap -> 96).
+    int const kBlockM_sm90 = (head_size_rounded <= 64 && is_causal && has_softcap) ? 96 : 64;
     int const kBlockM_sm80 = head_size_rounded <= 64 ? 128 : 64;
     int const kBlockM_sm86 = head_size_rounded <= 192 ? 64 : 32;
     int const kBlockM = arch >= 90 ? kBlockM_sm90 : (arch == 86 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
@@ -1320,12 +1321,13 @@ inline std::tuple<int, int> tile_size_bwd(int arch, int head_size_rounded, bool 
      TORCH_CHECK(!k_new_.has_value(), "This flash attention build does not support appending KV.");
      #endif
  
-    // Per-row tile stats: optional tensor of shape (batch, num_heads, seq_q, num_n_blocks), float32 (local tile LSE).
+    // Per-row tile stats: shape (batch, num_heads, seq_q, num_n_blocks), float32.
+    // Need NOT be contiguous: kernel uses explicit strides.  Allocating as
+    // [B,H,N,T].permute(0,1,3,2) gives stride_m=1 for coalesced writes.
     if (tile_stats_.has_value()) {
         auto tile_stats = tile_stats_.value();
         CHECK_DEVICE(tile_stats);
         TORCH_CHECK(tile_stats.dtype() == torch::kFloat32, "tile_stats must be float32");
-        TORCH_CHECK(tile_stats.is_contiguous(), "tile_stats must be contiguous");
         TORCH_CHECK(tile_stats.dim() == 4,
                     "tile_stats must have shape (batch, num_heads, seq_q_or_m_blocks, num_n_blocks)");
         params.ptr_tile_stats = tile_stats.data_ptr<float>();
@@ -1710,22 +1712,40 @@ inline std::tuple<int, int> tile_size_bwd(int arch, int head_size_rounded, bool 
     TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
     #endif
 
-    // Set block sparsity mask pointers
+    // Block sparsity mask — transpose to column-major [B, H, C, R] for stride-1 kernel access
+    at::Tensor block_mask_T;
+    at::Tensor work_remap_tensor;
     if (block_mask_.has_value()) {
         auto block_mask = block_mask_.value();
         CHECK_DEVICE(block_mask);
         TORCH_CHECK(block_mask.dtype() == torch::kUInt8, "block_mask must be uint8");
-        TORCH_CHECK(block_mask.is_contiguous(), "block_mask must be contiguous");
-        params.ptr_block_mask = static_cast<uint8_t*>(block_mask.data_ptr());
-        // Calculate num_row_tiles and num_col_tiles from block_mask shape
-        // Expected shape: [batch, head, num_row_tiles, num_col_tiles]
         TORCH_CHECK(block_mask.dim() == 4, "block_mask must have 4 dimensions [batch, head, num_row_tiles, num_col_tiles]");
         params.num_row_tiles = block_mask.size(2);
         params.num_col_tiles = block_mask.size(3);
+        block_mask_T = block_mask.permute({0, 1, 3, 2}).contiguous();
+        params.ptr_block_mask = static_cast<uint8_t const*>(block_mask_T.data_ptr());
+
+        // Sorted CTA scheduling: sort columns by active row count within each
+        // (batch, head) slice, keeping heads contiguous to preserve L2 locality.
+        // block_mask is [B, H, num_m, num_n].  Sum over m → [B, H, num_n].
+        int num_n = block_mask.size(3);
+        int bh = block_mask.size(0) * block_mask.size(1);  // B * H
+        auto active_count = block_mask.to(torch::kFloat32).sum(/*dim=*/2);  // [B, H, num_n]
+        // Sort within each (B, H) slice along dim=-1 (column dimension)
+        auto sorted_result = active_count.reshape({bh, num_n}).sort(/*dim=*/1, /*descending=*/true);
+        auto sorted_col_idx = std::get<1>(sorted_result);  // [B*H, num_n] — column indices per head
+        // Build bidhb index: [B*H, num_n] where each row has the same bidhb value
+        auto bidhb_range = torch::arange(bh, block_mask.options().dtype(torch::kLong))
+                               .unsqueeze(1).expand({bh, num_n});
+        // Pack: upper 16 bits = bidhb, lower 16 bits = n_block
+        auto packed = bidhb_range.to(torch::kInt32) * 65536 + sorted_col_idx.to(torch::kInt32);
+        work_remap_tensor = packed.reshape({-1}).contiguous();
+        params.work_remap = work_remap_tensor.data_ptr<int32_t>();
     } else {
         params.ptr_block_mask = nullptr;
         params.num_row_tiles = 0;
         params.num_col_tiles = 0;
+        params.work_remap = nullptr;
     }
 
     if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
