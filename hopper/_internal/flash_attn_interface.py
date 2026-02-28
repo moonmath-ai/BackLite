@@ -43,7 +43,7 @@ def _generate_mask_from_stats_mass(tile_stats, seq_q, head_dim, head_dim_v, dtyp
     )
     tile_info_fwd = flash_attn_3_cuda.get_tile_size_fwd_sm90(
         head_dim, head_dim_v, is_causal, is_local,
-        element_size, False, False, has_softcap, False, dtype == torch.int8,
+        element_size, False, False, has_softcap, dtype == torch.int8,
     )
     kBlockN_fwd = tile_info_fwd[1]
 
@@ -92,13 +92,6 @@ def _flash_attn_forward(
         num_splits=1,
         pack_gqa=None,
         sm_margin=0,
-        # qk_skip_mask_args=None,
-        attn_read_list=None,
-        attn_must_do_list=None,
-        attn_write_list=None,
-        thr=-3.0,
-        reverse_skip_list=False,
-        phase=False,
         tile_stats=None,
     ):
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
@@ -147,13 +140,6 @@ def _flash_attn_forward(
         num_splits,
         pack_gqa,
         sm_margin,
-        # qk_skip_mask_args,
-        attn_read_list,
-        attn_must_do_list,
-        attn_write_list,
-        thr=thr,
-        reverse_skip_list=reverse_skip_list,
-        phase=phase,
         tile_stats=tile_stats,
     )
     return out, softmax_lse, *rest
@@ -227,13 +213,6 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         deterministic=False,
         num_heads_q=None,
         sm_margin=0,
-        # qk_skip_mask_args=None,
-        attn_read_list=None,
-        attn_must_do_list=None,
-        attn_write_list=None,
-        thr=-3.0,
-        reverse_skip_list=False,
-        phase=False,
     ):
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -265,14 +244,6 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             attention_chunk=attention_chunk,
             softcap=softcap,
             sm_margin=sm_margin,
-            # qk_skip_mask_args=qk_skip_mask_args,
-            attn_read_list=attn_read_list,
-            attn_must_do_list=attn_must_do_list,
-            attn_write_list=attn_write_list,
-            thr=thr,
-            reverse_skip_list=reverse_skip_list,
-            phase=phase,
-            tile_stats=None,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
         ctx.save_for_backward(q, k, v, out, softmax_lse, *rest)
@@ -322,7 +293,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.sm_margin,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dqkv, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -344,14 +315,7 @@ class FlashAttnFunc(torch.autograd.Function):
         pack_gqa=None,
         deterministic=False,
         sm_margin=0,
-        # qk_skip_mask_args=None,
-        attn_read_list=None,
-        attn_must_do_list=None,
-        attn_write_list=None,
-        thr=-3.0,
         return_softmax_lse=False,
-        reverse_skip_list=False,
-        phase=False,
         tile_stats=None,
         negl_prob=0.0,
     ):
@@ -361,7 +325,7 @@ class FlashAttnFunc(torch.autograd.Function):
             fwd_is_local = (window_size[0] >= 0 or window_size[1] >= 0) and not causal
             result = flash_attn_3_cuda.get_tile_size_fwd_sm90(
                 head_dim, head_dim, causal, fwd_is_local, q.element_size(),
-                False, False, False, False, (q.dtype == torch.int8)
+                False, False, False, (q.dtype == torch.int8)
             )
             kBlockM, kBlockN = result[0], result[1]
             num_n_blocks = (k.shape[1] + kBlockN - 1) // kBlockN
@@ -401,11 +365,6 @@ class FlashAttnFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
-            # qk_skip_mask_args=qk_skip_mask_args,
-            attn_read_list=attn_read_list,
-            attn_must_do_list=attn_must_do_list,
-            attn_write_list=attn_write_list,
-            thr=thr,
             tile_stats=tile_stats,
         )
 
@@ -472,7 +431,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, *((None,) * 22)
+        return dq, dk, dv, *((None,) * 16)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -500,11 +459,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         pack_gqa=None,
         deterministic=False,
         sm_margin=0,
-        # qk_skip_mask_args=None,
-        attn_read_list=None,
-        attn_must_do_list=None,
-        attn_write_list=None,
-        thr=-3.0,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -534,11 +488,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
-            # qk_skip_mask_args=None,
-            attn_read_list=attn_read_list,
-            attn_must_do_list=attn_must_do_list,
-            attn_write_list=attn_write_list,
-            thr=thr,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -584,7 +533,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -662,14 +611,7 @@ def flash_attn_func(
     pack_gqa=None,
     deterministic=False,
     sm_margin=0,
-    # qk_skip_mask_args=None,
-    attn_read_list=None,
-    attn_must_do_list=None,
-    attn_write_list=None,
-    thr=-3.0,
     return_softmax_lse=False,
-    reverse_skip_list=False,
-    phase=False,
     tile_stats=None,
     negl_prob=0.0,
 ):
@@ -733,14 +675,7 @@ def flash_attn_func(
         pack_gqa,
         deterministic,
         sm_margin,
-        # qk_skip_mask_args,
-        attn_read_list,
-        attn_must_do_list,
-        attn_write_list,
-        thr,
         return_softmax_lse,
-        reverse_skip_list,
-        phase,
         tile_stats,
         negl_prob,
     )
@@ -827,11 +762,6 @@ def flash_attn_with_kvcache(
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
-    # qk_skip_mask_args=None,
-    attn_read_list=None,
-    attn_must_do_list=None,
-    attn_write_list=None,
-    thr=-3.0,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -959,11 +889,6 @@ def flash_attn_with_kvcache(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
-        # qk_skip_mask_args=qk_skip_mask_args,
-        attn_read_list=attn_read_list,
-        attn_must_do_list=attn_must_do_list,
-        attn_write_list=attn_write_list,
-        thr=thr,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out

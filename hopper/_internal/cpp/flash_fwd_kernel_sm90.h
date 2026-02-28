@@ -19,7 +19,6 @@
 #include "seqlen.h"
 #include "utils.h"
 #include "softmax.h"
-#include "skip_list.h"
 
 namespace flash
 {
@@ -66,11 +65,6 @@ namespace flash
         static constexpr bool LargeHeadDimV = CollectiveMainloop::LargeHeadDimV;
         static_assert(CollectiveMainloop::LargeHeadDimV == CollectiveEpilogue::LargeHeadDimV);
         using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
-
-        static constexpr bool Is_skipable = CollectiveMainloop::Is_skipable;
-        static constexpr bool ReverseSkipList = CollectiveMainloop::ReverseSkipList;
-        static constexpr bool Phase = CollectiveMainloop::Phase;
-        static constexpr bool HasMustDoList = CollectiveMainloop::HasMustDoList;
 
         // Mainloop derived types
         using TileShape_MNK_PV = typename CollectiveMainloop::TileShape_MNK_PV;
@@ -127,7 +121,6 @@ namespace flash
         static constexpr int mainloop_smem_padding_ = int(sizeof(typename CollectiveEpilogue::TensorStorage)) - int(sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v)));
         static constexpr int mainloop_smem_padding = mainloop_smem_padding_ < 0 ? 0 : mainloop_smem_padding_;
 
-        static constexpr int BufferSize = CollectiveMainloop::kStagesForSkips * 2;
         struct SharedStorage
         {
             struct TensorStorage : cute::aligned_struct<128, _1>
@@ -156,9 +149,6 @@ namespace flash
                 alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
                 alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
             } pipelines;
-
-            // SkipListStorage<BufferSize> skip_list_storage;
-            SkipListStorage<BufferSize, ReverseSkipList, Phase, HasMustDoList> skip_list_storage;
         };
 
         static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -420,21 +410,6 @@ namespace flash
 
                 cutlass::arch::wait_on_dependent_grids();
 
-                // // Initialize skip_writer in shared memory with shared memory buffers
-                // // Use placement new to initialize the writer that resides in shared memory
-                // new (&shared_storage.skip_list_storage.writer) DelayedSkipListWriter<CollectiveMainloop::kStages, ReverseSkipList, Phase, HasMustDoList>(
-                //     shared_storage.skip_list_storage.n_blocks_buffer,
-                //     shared_storage.skip_list_storage.end_range_buffer,
-                //     shared_storage.skip_list_storage.skip_tests
-                // );
-                // consider: move this to shared memory to reduce register pressure + not needing to worry about which thread been elected
-                // Initialize skip_writer with shared memory buffers
-                DelayedSkipListWriter<CollectiveMainloop::kStagesForSkips, ReverseSkipList, Phase, HasMustDoList> skip_writer(
-                    shared_storage.skip_list_storage.n_blocks_buffer,
-                    shared_storage.skip_list_storage.end_range_buffer,
-                    shared_storage.skip_list_storage.skip_tests
-                );
-
                 bool should_load_KV=false;
                 // Load Q, K, V
                 for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0
@@ -474,13 +449,10 @@ namespace flash
                     };
 
                     should_load_KV = mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
-                                shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx, skip_writer);
-                                // shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx, shared_storage.skip_list_storage.writer);
-                                // shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx, skip_reader, skip_writer);
+                                shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
 
                 }
-                mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx, skip_writer, should_load_KV);
-                // mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx, shared_storage.skip_list_storage.writer, should_load_KV);
+                mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx, should_load_KV);
             }
             else
             { // Consumer

@@ -11,7 +11,6 @@
 #include <cutlass/numeric_types.h>
 
 #include "utils.h"
-#include "skip_list.h"
 
 namespace flash
 {
@@ -264,128 +263,6 @@ namespace flash
             // dequan_s = dequan_k * softmax_scale_log2;
             dequan_s = __shfl_sync(0xffffffff, dequan_k * softmax_scale_log2, 0);
         }
-
-        template <int kBlockM, typename TiledMma, bool const Is_first, bool const Check_inf = false, typename Tensor0>
-        __forceinline__ __device__ TensorT max_get_scale_detect_qk_skip(
-            Tensor0 &acc_s,
-            const float threshold,
-            auto &skip_reader,
-            const int m_block)
-        {
-            // For INT8: acc_s contains int32 values from INT8 MMA
-            // For non-INT8: acc_s contains float values
-            // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
-            Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
-            static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
-            TensorT scores_scale;
-            if constexpr (Is_first)
-            {
-                // consider: seperate into  max scores (over int's) and after it dequantize (multiply by dequan_s) and take the max with row_max
-                // flash::template reduce_max</*zero_init=*/true>(scores, row_max);
-                if constexpr (!Is_INT8) {
-                    flash::template reduce_max</*zero_init=*/true>(scores, row_max);
-                } else {
-                    flash::template reduce_max_dequantize</*zero_init=*/true>(scores, row_max, dequan_s);
-                }
-                cute::fill(scores_scale, 1.f);
-                if (is_warp_leader)
-                {
-                    skip_reader.update_skip(false, warp_idx_in_warpgroup);
-                }
-            }
-            else
-            {
-                Tensor scores_max_prev = make_fragment_like(row_max);
-                cute::copy(row_max, scores_max_prev);
-
-                // find the local max for each row
-                Tensor scores_max_local = make_fragment_like(row_max);
-                /*
-                inside reduce_max, each thread reduces over the columns he holds.
-                each thread holds a querter of the columns, for example:
-                for headdim == 128, we have 176 columns so each thread holds 176 / 4 = 44 columns.
-                each 4 consecutive threads hold TOGTHER the full row.
-                after the thread level reduction, we reduce across each 4 consecutive threads and get the local max for the row.
-                */
-                // flash::template reduce_max</*zero_init=*/true>(scores, scores_max_local);
-                if constexpr (!Is_INT8) {
-                    flash::template reduce_max</*zero_init=*/true>(scores, scores_max_local);
-                } else {
-                    flash::template reduce_max_dequantize</*zero_init=*/true>(scores, scores_max_local, dequan_s);
-                }
-
-                // update row max
-                // thread_reduce_<true>(scores_max_local, row_max, MaxOp<float>());
-                // flash::template reduce_max</*zero_init=*/false>(scores, row_max);
-
-                // Compute row bounds following the same pattern as mask.h
-                // Create identity tensor and partition it to get row coordinates
-                auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
-                auto thread0_mma = TiledMma{}.get_thread_slice(_0{});
-                Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockM>>{});  // Dummy shape, only need row info
-                Tensor tScS = thread_mma.partition_C(cS);
-                Tensor t0ScS = thread0_mma.partition_C(cS);
-                Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol(tScS.layout()));
-                Tensor t0ScS_rowcol = make_tensor(t0ScS.data(), flash::convert_layout_acc_rowcol(t0ScS.layout()));
-                
-                // Compute thread_row_offset and seqlenq_row_limit following mask.h pattern
-                int const thread_row_offset = get<0>(tScS_rowcol(_0{}, _0{}));
-                int const seqlenq_row_limit = seqlen_q - m_block * kBlockM - thread_row_offset;
-                
-                bool do_qk = false;
-#pragma unroll
-                for (int mi = 0; mi < size(row_max); ++mi)
-                {
-                    // Check if this row is out of bounds, following mask.h pattern
-                    // Use t0ScS_rowcol to get compile-time known row indices
-                    const bool row_not_out_of_bounds = !(int(get<0>(t0ScS_rowcol(mi, _0{}))) >= seqlenq_row_limit);
-                    
-                    // update row max
-                    row_max(mi) = max(row_max(mi), scores_max_local(mi));
-                    // float cur = !Check_inf
-                    //                 ? row_max(mi)
-                    //                 : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
-                    float cur;
-                    if constexpr (Check_inf){
-                        cur = row_max(mi) == -INFINITY ? 0.0f : row_max(mi);
-                    }else{
-                        cur = row_max(mi);
-                    }
-                    float prev = scores_max_prev(mi);
-                    // consider: removing all the uses of softmax_scale_log2 when Is_INT8 is enabled
-                    if constexpr (!Is_INT8) {
-                        scores_scale(mi) = exp2f((prev - cur) * softmax_scale_log2);
-                    } else {
-                        scores_scale(mi) = exp2f((prev - cur));
-                    }
-                    row_sum(mi) *= scores_scale(mi);
-
-                    // do_qk |= (((scores_max_local(mi) - prev) * softmax_scale_log2) > thr) & row_not_out_of_bounds;
-
-                    // do_qk |= ((scores_max_local(mi) * thr) >= prev) & row_not_out_of_bounds;
-
-                    // bool cond1 = (scores_max_local(mi) - prev + abs(scores_max_local(mi)) * 0.5f >= 0); // if the current max is at least 1.5 times the previous max
-                    bool cond1 = true;
-                    // bool cond2 = ((scores_max_local(mi) - prev) * softmax_scale_log2) > threshold; // if the current max is more than threshold times the previous max
-                    bool cond2;
-                    if constexpr (!Is_INT8) {
-                        cond2 = ((scores_max_local(mi) - prev) * softmax_scale_log2) > threshold; // if the current max is more than threshold times the previous max
-                    } else {
-                        cond2 = ((scores_max_local(mi) - prev) > threshold); // if the current max is more than threshold times the previous max
-                    }
-                    do_qk |= cond1 & cond2 & row_not_out_of_bounds; // if both conditions are true and the row is not out of bounds, then set do_qk to true
-                }
-
-                // (warp = 32) * 4 = warpgroup, 2 * warpgroup
-                const bool skip = !__any_sync(0xffffffffu, do_qk);
-                if (is_warp_leader)
-                {
-                    skip_reader.update_skip(skip, warp_idx_in_warpgroup);
-                }
-            }
-
-            return scores_scale;
-        };
 
         // TONY: acc_s is Q times K for one tile
         template <bool const Is_first, bool const Check_inf = false, typename Tensor0>

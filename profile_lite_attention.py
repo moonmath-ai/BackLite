@@ -14,9 +14,8 @@ for head_dim in [32, 64, 96, 128, 192, 256]:
     print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
     print(f"head_dim: {head_dim}")
     attn = LiteAttention()
-    attn.threshold = float(2)
     for i in range(2):
         q, k, v = init_qkv(head_dim)
         output = attn(q, k, v)
     torch.cuda.synchronize()
-    print(attn._skip_list.shape)
+    print(f"output shape: {output.shape}")

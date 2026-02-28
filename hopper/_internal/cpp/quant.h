@@ -17,7 +17,7 @@ void launch_quantize_qk_runtime(
     int8_t* Q_q, int8_t* K_q,
     float* q_scales, float* k_scales, const float* k_mean,
     int batch, int seqlen_q, int seqlen_k, int num_heads,
-    int head_dim, bool v_colmajor, bool is_skipable,
+    int head_dim, bool v_colmajor,
     double q_scale,
     cudaStream_t stream);
 
@@ -27,7 +27,7 @@ extern template void launch_quantize_qk_runtime<cutlass::half_t>(
     int8_t*, int8_t*,
     float*, float*, const float*,
     int, int, int, int,
-    int, bool, bool,
+    int, bool,
     double,
     cudaStream_t);
 
@@ -36,6 +36,6 @@ extern template void launch_quantize_qk_runtime<cutlass::bfloat16_t>(
     int8_t*, int8_t*,
     float*, float*, const float*,
     int, int, int, int,
-    int, bool, bool,
+    int, bool,
     double,
     cudaStream_t);

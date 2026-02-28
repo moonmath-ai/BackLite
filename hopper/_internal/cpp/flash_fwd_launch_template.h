@@ -51,7 +51,7 @@ using namespace cute; // Import CuTe namespace for tensor operations and layout 
  */
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
-          bool PackGQA, bool Split, bool V_colmajor, bool Is_skipable, bool ReverseSkipList=false, bool Phase=true, bool HasMustDoList=false>
+          bool PackGQA, bool Split, bool V_colmajor>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream)
 {
     // Compile-time validation of template parameter combinations
@@ -75,7 +75,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream)
 
     // SM90+ tile configuration: returns (BlockM, BlockN, MmaPV_is_RS, IntraWGOverlap)
     static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap =
-        tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, Is_skipable, Is_INT8);
+        tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, Is_INT8);
 
     // SM80-89 tile configuration: returns (BlockM, BlockN, NWarps, Stages, Q_in_regs)
     static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS =
@@ -127,11 +127,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream)
             IntraWGOverlap,      // 1
             PackGQA,             // 0
             Split,               // 0
-            V_colmajor,          // 0
-            Is_skipable,         // 0
-            ReverseSkipList,     // 0
-            Phase,               // 0
-            HasMustDoList>,      // 0
+            V_colmajor>,         // 0
         // SM80-89 mainloop: Traditional warp-level cooperation with manual shared memory management
         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80,
                                          Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split>>;
@@ -176,8 +172,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream)
     // since we'll avoid launching a bunch of thread blocks that immediately exit.
     // On Sm80, noncausal persistent seems a bit slower.
     // static constexpr bool UsePersistentScheduler = Arch >= 90 ? !(Split && !Varlen) : ((Is_causal && !Varlen) || (Varlen && Split));
-    // static constexpr bool UsePersistentScheduler = ((Arch >= 90) && !Is_skipable) ? !(Split && !Varlen) : ((Is_causal && !Varlen) || (Varlen && Split));
-    static constexpr bool UsePersistentScheduler = !Is_skipable && ((Arch >= 90) ? !(Split && !Varlen) : ((Is_causal && !Varlen) || (Varlen && Split)));
+    static constexpr bool UsePersistentScheduler = (Arch >= 90) ? !(Split && !Varlen) : ((Is_causal && !Varlen) || (Varlen && Split));
     using Scheduler = std::conditional_t<!UsePersistentScheduler, SchedulerSingleTile, SchedulerPersistent>;
 
     // Final attention kernel type combining all components with CuTe-based tensor operations
@@ -281,7 +276,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream)
         params.seqused_k, // Actual sequence lengths used (for padding)
         params.leftpad_k,
         params.seqlens_rotary, // Left padding for K and rotary position lengths
-        params.qk_skip_mask_args,
         // Per-tile stats (local tile LSE) for sparsity masking
         params.ptr_tile_stats,
         {params.stride_tile_batch, params.stride_tile_head, params.stride_tile_m, params.stride_tile_n},
@@ -308,8 +302,6 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream)
     int num_blocks_m = cutlass::ceil_div(params.seqlen_q * qhead_per_khead, get<0>(TileShape_MNK{}));
     num_blocks_m = cutlass::round_up(num_blocks_m, size<0>(ClusterShape{})); // Round up for cluster alignment
     // DOR: the total number of Q blocks is ceil_div(len(Q), 128) and
-
-    // printf("Device pointer: %p\n", mainloop_args.qk_skip_mask_args.attn_read_list);
 
     // Scheduler arguments for coordinating work distribution across SMs
     typename flash::TileSchedulerArguments scheduler_args{
@@ -391,37 +383,19 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream)
                                            {
             static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
             VARLEN_SWITCH(params.cu_seqlens_q || params.cu_seqlens_k || params.seqused_q || params.seqused_k || params.leftpad_k, Varlen, [&] {
-                // Reorder switches: HasQV_ -> AppendKV -> Is_skipable -> HasMustDoList -> ReverseSkipList -> Phase
-                // This ensures invalid combinations (HasMustDoList or ReverseSkipList true when Is_skipable false) are never generated
+                // Reorder switches: HasQV_ -> AppendKV
                 BOOL_SWITCH(params.qv_ptr, HasQV_, [&] {
                     static constexpr bool HasQv = HasQV_ && Arch == 90 && !Is_8Bit && kHeadDim == 64 && kHeadDimV >= 256;
                     APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
-                        BOOL_SWITCH(params.is_skipable, Is_skipable, [&] {
                             // Only needed here to decide if we should use cluster
-                            static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, Is_skipable, Is_INT8)) : 128;
+                            static constexpr int kBlockM = Arch >= 90 ? std::get<0>(tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(T) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, Is_INT8)) : 128;
                             // DOR: in our case this is always true since kHeadDim == 128, Arch == 90 ...
                             static constexpr bool Enable_cluster = Arch == 90 && (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) && !Is_causal && !Is_local && !Split && !PagedKVNonTMA && !Varlen;
                             // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                             CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
                                 static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
-                                if constexpr (!Is_skipable) {
-                                    // When Is_skipable is disabled, use default values
-                                    static constexpr bool HasMustDoList = false;
-                                    static constexpr bool ReverseSkipList = false;
-                                    static constexpr bool Phase = true;
-                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Is_skipable, ReverseSkipList, Phase, HasMustDoList>(params, stream);
-                                } else {
-                                    // When Is_skipable is enabled, check HasMustDoList, ReverseSkipList, and Phase
-                                    BOOL_SWITCH(params.has_must_do_list, HasMustDoList, [&] {
-                                        BOOL_SWITCH(params.reverse_skip_list, ReverseSkipList, [&] {
-                                            BOOL_SWITCH(params.phase, Phase, [&] {
-                                                run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, Is_skipable, ReverseSkipList, Phase, HasMustDoList>(params, stream);
-                                            });
-                                        });
-                                    });
-                                }
+                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor>(params, stream);
                             });
-                        });
                     });
                 });
             }); }); });
