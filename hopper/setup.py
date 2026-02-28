@@ -33,7 +33,7 @@ with open("../README.md", "r", encoding="utf-8") as fh:
 # ninja build does not work unless include_dirs are abs path
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
-PACKAGE_NAME = "lite_attention"
+PACKAGE_NAME = "back_lite"
 
 BASE_WHEEL_URL = "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
 
@@ -399,7 +399,7 @@ if not SKIP_CUDA_BUILD:
     check_if_cuda_home_none(PACKAGE_NAME)
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
     if bare_metal_version < Version("12.3"):
-        raise RuntimeError("Lite Attention is only supported on CUDA 12.3 and above")
+        raise RuntimeError("Back Lite is only supported on CUDA 12.3 and above")
 
     # ptxas 12.8 gives the best perf currently
     # We want to use the nvcc front end from 12.6 however, since if we use nvcc 12.8
@@ -574,7 +574,7 @@ if not SKIP_CUDA_BUILD:
 
     ext_modules.append(
         CUDAExtension(
-            name=f"lite_attention._C",
+            name=f"back_lite._C",
             sources=sources,
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17", "-DPy_LIMITED_API=0x03090000"] + feature_args,
@@ -657,9 +657,9 @@ class CachedWheelsCommand(_bdist_wheel):
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),
-    packages=["lite_attention", "lite_attention._internal"],
-    package_dir={"lite_attention": "."},
-    description="Lite Attention",
+    packages=["back_lite", "back_lite._internal"],
+    package_dir={"back_lite": "."},
+    description="Back Lite",
     long_description=long_description,
     long_description_content_type="text/markdown",
     classifiers=[

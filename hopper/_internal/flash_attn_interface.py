@@ -7,17 +7,17 @@ import torch.nn as nn
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
-import lite_attention._C # Registers operators with PyTorch
+import back_lite._C # Registers operators with PyTorch
 
 # isort: on
 
-flash_attn_3_cuda = torch.ops.lite_attention
+flash_attn_3_cuda = torch.ops.back_lite
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 # Fused Triton kernel: single-pass mask generation from cumulative LSE.
-from lite_attention._internal.tile_stats_reduce import mask_from_stats_fused as _mask_from_stats_fused
+from back_lite._internal.tile_stats_reduce import mask_from_stats_fused as _mask_from_stats_fused
 
 
 def _mask_from_stats_compiled(tile_lse, softmax_lse, num_row_tiles, kBlockM_bwd, negl_prob):

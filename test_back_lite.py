@@ -1,5 +1,5 @@
 import torch
-from lite_attention import LiteAttention
+from back_lite import BackLite
 
 
 def generate_test_tensors(batch, seq_len, heads, head_dim):
@@ -32,7 +32,7 @@ def compute_error_metrics(output, reference, name=""):
 
 def test_basic_forward(q, k, v, head_dim, use_int8=False):
     """Test that a basic forward pass runs without error."""
-    attn = LiteAttention(use_int8=use_int8)
+    attn = BackLite(use_int8=use_int8)
     torch.cuda.synchronize()
     output = attn(q, k, v)
     torch.cuda.synchronize()
@@ -47,7 +47,7 @@ def test_basic_forward(q, k, v, head_dim, use_int8=False):
 
 def test_forward_with_tile_stats(q, k, v, head_dim, use_int8=False):
     """Test that forward pass collects tile_stats when negl_prob > 0."""
-    attn = LiteAttention(use_int8=use_int8, negl_prob=0.01)
+    attn = BackLite(use_int8=use_int8, negl_prob=0.01)
     torch.cuda.synchronize()
     output = attn(q, k, v)
     torch.cuda.synchronize()
@@ -69,7 +69,7 @@ def test_softmax_lse_correctness(q, k, v, head_dim, tolerance=0.001, use_int8=Fa
     ref_lse = torch.logsumexp(scores, dim=-1)  # [B, H, S]
 
     # Flash attention LSE
-    attn = LiteAttention(use_int8=use_int8)
+    attn = BackLite(use_int8=use_int8)
     torch.cuda.synchronize()
     output, lse = attn(q, k, v, scale=scale, return_softmax_lse=True)
     torch.cuda.synchronize()
@@ -91,21 +91,21 @@ def test_int8_correctness(q, k, v, head_dim, tolerance_max_abs=0.1, tolerance_co
     """Test that INT8 output matches BF16 output within acceptable tolerance."""
     scale = 1.0 / (head_dim ** 0.5)
 
-    tile_size_bf16 = LiteAttention.get_MN(head_dim, torch.bfloat16)
-    tile_size_int8 = LiteAttention.get_MN(head_dim, torch.int8)
+    tile_size_bf16 = BackLite.get_MN(head_dim, torch.bfloat16)
+    tile_size_int8 = BackLite.get_MN(head_dim, torch.int8)
     tile_sizes_match = tile_size_bf16 == tile_size_int8
 
     if not tile_sizes_match:
         print(f"    ⚠️  Tile sizes differ (BF16: {tile_size_bf16}, INT8: {tile_size_int8})")
 
     # BF16 reference
-    attn_bf16 = LiteAttention(use_int8=False)
+    attn_bf16 = BackLite(use_int8=False)
     torch.cuda.synchronize()
     output_bf16 = attn_bf16(q, k, v, scale=scale)
     torch.cuda.synchronize()
 
     # INT8
-    attn_int8 = LiteAttention(use_int8=True)
+    attn_int8 = BackLite(use_int8=True)
     torch.cuda.synchronize()
     output_int8 = attn_int8(q, k, v, scale=scale)
     torch.cuda.synchronize()
@@ -131,7 +131,7 @@ def test_backward_basic(q, k, v, head_dim, use_int8=False):
     q = q.clone().detach().requires_grad_(True)
     k = k.clone().detach().requires_grad_(True)
     v = v.clone().detach().requires_grad_(True)
-    attn = LiteAttention(use_int8=use_int8)
+    attn = BackLite(use_int8=use_int8)
     output = attn(q, k, v)
     loss = output.sum()
     loss.backward()
@@ -146,7 +146,7 @@ def test_backward_with_sparsity(q, k, v, head_dim, use_int8=False):
     q = q.clone().detach().requires_grad_(True)
     k = k.clone().detach().requires_grad_(True)
     v = v.clone().detach().requires_grad_(True)
-    attn = LiteAttention(use_int8=use_int8, negl_prob=0.01)
+    attn = BackLite(use_int8=use_int8, negl_prob=0.01)
     output = attn(q, k, v)
     loss = output.sum()
     loss.backward()

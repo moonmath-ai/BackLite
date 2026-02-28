@@ -89,7 +89,7 @@ def quantize_to_fp8(tensor, fp8_dtype=torch.float8_e4m3fn):
 #     except ImportError:
 #         raise ImportError("Could not import flash_attn_func. Make sure flash-attention is properly installed.")
 
-from lite_attention import LiteAttention
+from back_lite import BackLite
 from flash_attn_interface import flash_attn_func
 
 def main():
@@ -135,9 +135,9 @@ def main():
     
     warmup_iters = 1
     
-    # Initialize LiteAttention instances for warmup
-    lite_attn_warmup = LiteAttention(enable_skipping=False)
-    lite_attn_int8_warmup = LiteAttention(enable_skipping=False, use_int8=True)
+    # Initialize BackLite instances for warmup
+    back_lite_inst_warmup = BackLite(enable_skipping=False)
+    back_lite_inst_int8_warmup = BackLite(enable_skipping=False, use_int8=True)
     
     # Prepare FP8 tensors for warmup
     q_fp8_warmup, descale_q_warmup = quantize_to_fp8(q)
@@ -147,14 +147,14 @@ def main():
     for i in range(warmup_iters):
         # BF16 FA3
         _ = flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=causal, window_size=(-1, -1))
-        # BF16 LiteAttention
-        _ = lite_attn_warmup(q, k, v, scale=softmax_scale)
+        # BF16 BackLite
+        _ = back_lite_inst_warmup(q, k, v, scale=softmax_scale)
         # FP8 FA3
         _ = flash_attn_func(q_fp8_warmup, k_fp8_warmup, v_fp8_warmup, softmax_scale=softmax_scale, 
                            causal=causal, window_size=(-1, -1), 
                            q_descale=descale_q_warmup, k_descale=descale_k_warmup, v_descale=descale_v_warmup)
-        # INT8 LiteAttention
-        _ = lite_attn_int8_warmup(q, k, v, scale=softmax_scale)
+        # INT8 BackLite
+        _ = back_lite_inst_int8_warmup(q, k, v, scale=softmax_scale)
     
     torch.cuda.synchronize()
     print(f"Warmup completed ({warmup_iters} iterations per kernel)")
@@ -180,14 +180,14 @@ def main():
     print(f"BF16 Reference Output dtype: {out_bf16_ref.dtype}")
 
     # ============================================================================
-    # BF16 Forward Pass (LiteAttention)
+    # BF16 Forward Pass (BackLite)
     # ============================================================================
     print("\n" + "="*70)
-    print("Running BF16 forward pass (LiteAttention)...")
+    print("Running BF16 forward pass (BackLite)...")
     print("="*70)
-    lite_attn = LiteAttention(enable_skipping=False)
+    back_lite_inst = BackLite(enable_skipping=False)
     torch.cuda.synchronize()
-    out_bf16_lite = lite_attn(
+    out_bf16_lite = back_lite_inst(
         q,
         k,
         v,
@@ -195,9 +195,9 @@ def main():
     )
     torch.cuda.synchronize()
     
-    print(f"BF16 LiteAttention Output shape: {out_bf16_lite.shape}")
-    print(f"BF16 LiteAttention Output dtype: {out_bf16_lite.dtype}")
-    compute_error_metrics(out_bf16_lite, out_bf16_ref, "BF16 LiteAttention")
+    print(f"BF16 BackLite Output shape: {out_bf16_lite.shape}")
+    print(f"BF16 BackLite Output dtype: {out_bf16_lite.dtype}")
+    compute_error_metrics(out_bf16_lite, out_bf16_ref, "BF16 BackLite")
     
     # ============================================================================
     # FP8 Forward Pass (without descale - naive conversion)
@@ -261,18 +261,18 @@ def main():
     compute_error_metrics(out_fp8_with_descale, out_bf16_ref, "FP8 (with descale)")
     
     # ============================================================================
-    # INT8 Forward Pass (LiteAttention with int8 enabled)
+    # INT8 Forward Pass (BackLite with int8 enabled)
     # ============================================================================
     print("\n" + "="*70)
-    print("Running INT8 forward pass (LiteAttention with int8 enabled)...")
+    print("Running INT8 forward pass (BackLite with int8 enabled)...")
     print("="*70)
     
-    # Initialize LiteAttention with int8 enabled
-    lite_attn_int8 = LiteAttention(enable_skipping=False, use_int8=True)
+    # Initialize BackLite with int8 enabled
+    back_lite_inst_int8 = BackLite(enable_skipping=False, use_int8=True)
     
     torch.cuda.synchronize()
-    out_int8 = lite_attn_int8(
-        q,  # Using original bfloat16 inputs - LiteAttention will handle quantization
+    out_int8 = back_lite_inst_int8(
+        q,  # Using original bfloat16 inputs - BackLite will handle quantization
         k,
         v,
         scale=softmax_scale,
@@ -281,7 +281,7 @@ def main():
     
     print(f"INT8 Output shape: {out_int8.shape}")
     print(f"INT8 Output dtype: {out_int8.dtype}")
-    compute_error_metrics(out_int8, out_bf16_ref, "INT8 LiteAttention")
+    compute_error_metrics(out_int8, out_bf16_ref, "INT8 BackLite")
     
     # ============================================================================
     # Summary of all error metrics
@@ -291,10 +291,10 @@ def main():
     print("="*70)
     
     results = [
-        ("BF16 LiteAttention", out_bf16_lite),
+        ("BF16 BackLite", out_bf16_lite),
         ("FP8 (no descale)", out_fp8_no_descale),
         ("FP8 (with descale)", out_fp8_with_descale),
-        ("INT8 LiteAttention", out_int8),
+        ("INT8 BackLite", out_int8),
     ]
     
     print(f"\n{'Method':<25} {'Max Abs Err':<14} {'Mean Abs Err':<14} {'RMSE':<14} {'Cosine Sim':<12}")

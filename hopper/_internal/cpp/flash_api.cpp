@@ -1921,7 +1921,7 @@ quantize_qk(
      return std::make_tuple(Q_q, K_q, q_descale, k_descale);
  }
  
- TORCH_LIBRARY(lite_attention, m) {
+ TORCH_LIBRARY(back_lite, m) {
      m.def("fwd("
          "Tensor q,"
          "Tensor k,"
@@ -2037,7 +2037,7 @@ quantize_qk(
         "float q_scale = 1.0) -> (Tensor, Tensor, Tensor, Tensor)", &quantize_qk);
  }
  
- TORCH_LIBRARY_IMPL(lite_attention, CUDA, m) {
+ TORCH_LIBRARY_IMPL(back_lite, CUDA, m) {
      m.impl("fwd", &mha_fwd);
      m.impl("bwd", &mha_bwd);
      m.impl("fwd_combine", &mha_combine);

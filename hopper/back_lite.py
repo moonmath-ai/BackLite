@@ -1,5 +1,5 @@
 """
-LiteAttention: A lightweight Flash Attention 3 wrapper with sparse backward pass.
+BackLite: A lightweight Flash Attention 3 wrapper with sparse backward pass.
 
 This module provides a clean interface for Flash Attention 3 with optional
 INT8 quantization and mass-based sparsity for the backward pass.
@@ -18,11 +18,11 @@ from typing import Optional, Tuple, Union
 from ._internal.flash_attn_interface import flash_attn_func
 
 # Import the C++ extension to register operators with PyTorch
-import lite_attention._C  # noqa: F401
-_lite_attention_ops = torch.ops.lite_attention
+import back_lite._C  # noqa: F401
+_back_lite_ops = torch.ops.back_lite
 
 
-class LiteAttention:
+class BackLite:
     """
     A lightweight attention class that encapsulates Flash Attention 3.
 
@@ -36,7 +36,7 @@ class LiteAttention:
             pass and block-sparse masking in the backward pass.
 
     Example:
-        >>> attn = LiteAttention(negl_prob=0.01)
+        >>> attn = BackLite(negl_prob=0.01)
         >>> output = attn(query, key, value)
     """
 
@@ -68,7 +68,7 @@ class LiteAttention:
         """
         is_int8 = dtype == torch.int8
         element_size = dtype.itemsize
-        result = _lite_attention_ops.get_tile_size_fwd_sm90(
+        result = _back_lite_ops.get_tile_size_fwd_sm90(
             head_dim, head_dim, False, False, element_size,
             v_colmajor, False, False, is_int8,
         )
@@ -94,7 +94,7 @@ class LiteAttention:
             k_mean = key.mean(dim=1).float().contiguous()
             head_dim = query.shape[-1]
             q_scale = (1.44269504089 * scale) if scale is not None else (1.44269504089 / math.sqrt(head_dim))
-            q_int8, k_int8, q_descale, k_descale = _lite_attention_ops.quantize_qk(
+            q_int8, k_int8, q_descale, k_descale = _back_lite_ops.quantize_qk(
                 query, key, k_mean, False, q_scale,
             )
             return q_int8, k_int8, q_descale, k_descale
@@ -146,11 +146,11 @@ class LiteAttention:
         return output
 
 
-class SeqParallelLiteAttention:
+class SeqParallelBackLite:
     """
-    Sequence-parallel wrapper around :class:`LiteAttention`.
+    Sequence-parallel wrapper around :class:`BackLite`.
 
-    Creates one :class:`LiteAttention` instance per node and routes calls
+    Creates one :class:`BackLite` instance per node and routes calls
     based on ``split_idx``.
 
     Args:
@@ -161,8 +161,8 @@ class SeqParallelLiteAttention:
 
     def __init__(self, num_nodes: int, use_int8: bool = False, negl_prob: float = 0.0, **_kwargs):
         self.num_nodes = num_nodes
-        self.lite_attention = [
-            LiteAttention(use_int8=use_int8, negl_prob=negl_prob)
+        self.back_lite = [
+            BackLite(use_int8=use_int8, negl_prob=negl_prob)
             for _ in range(num_nodes)
         ]
 
@@ -182,6 +182,6 @@ class SeqParallelLiteAttention:
             split_idx (int): Node index (0 .. num_nodes-1).
         """
         assert split_idx < self.num_nodes, "split_idx must be less than num_nodes"
-        return self.lite_attention[split_idx](
+        return self.back_lite[split_idx](
             query, key, value, scale, return_softmax_lse,
         )
