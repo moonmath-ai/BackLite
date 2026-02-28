@@ -28,6 +28,11 @@ namespace flash {
 
 using namespace cute;
 
+// Per-tile statistics for sparsity masking: one local tile LSE per (m_block, n_block) tile.
+struct TileStats {
+    float lse;   // local LSE for this tile row (ln space)
+};
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Helper to get the mask value for a given element type

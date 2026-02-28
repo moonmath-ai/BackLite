@@ -22,7 +22,7 @@ from test_util import (
 
 from flash_attn_interface import flash_attn_func, flash_attn_varlen_func, flash_attn_combine
 from flash_attn_interface import flash_attn_with_kvcache, get_scheduler_metadata
-from lite_attention import LiteAttention
+from back_lite import BackLite
 
 
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
@@ -83,7 +83,7 @@ COMPILED_HDIMS = (
         (4224, 4224),
     ],
 )
-def test_lite_attn_output(seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv, mha_type, dtype):
+def test_back_lite_attn_output(seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv, mha_type, dtype):
     if V_colmajor and (seqlen_k % 16 != 0 or dtype != torch.float8_e4m3fn):
         pytest.skip("V_colmajor requires seqlen_k to be a multiple of 16 and dtype to be float8_e4m3fn")
     if has_qv and (d != 64 or dtype == torch.float8_e4m3fn):
@@ -106,7 +106,7 @@ def test_lite_attn_output(seqlen_q, seqlen_k, d, causal, local, softcap, V_colma
         dv_vals = [256, 512]
     attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if not DISABLE_LOCAL else [0]
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
-        lite_attn = LiteAttention(enable_skipping=True, threshold=-3.0)
+        back_lite_attn = BackLite(enable_skipping=True, threshold=-3.0)
 
         print(f"{dv = }, {attention_chunk = }")
         # q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref)

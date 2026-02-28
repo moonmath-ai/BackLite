@@ -53,11 +53,7 @@ def get_parameter_annotation(line, context_stack):
         "IntraWGOverlap - Intra-warpgroup overlap",
         "PackGQA - Packed GQA layout",
         "Split - Sequence parallelism",
-        "V_colmajor - V column-major layout",
-        "Is_skipable - Can skip computation",
-        "ReverseSkipList - Reverse skip list",
-        "Phase - Phase flag",
-        "HasMustDoList - Must-do list flag"
+        "V_colmajor - V column-major layout"
     ]
     
     # CollectiveEpilogueFwd parameters  
@@ -118,11 +114,7 @@ def format_demangled_signature(demangled):
         "IntraWGOverlap",
         "PackGQA",
         "Split",
-        "V_colmajor",
-        "Is_skipable",
-        "ReverseSkipList",
-        "Phase",
-        "HasMustDoList"
+        "V_colmajor"
     ]
     
     epilogue_params = [

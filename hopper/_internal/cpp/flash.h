@@ -5,19 +5,10 @@
 #pragma once
 
 #include <cuda.h>
+#include <cuda_runtime.h>
 #include <vector>
 
 // #include "softmax.h"
-
-struct QKSkipMaskArgs
-{
-    // int *attn_read_list;
-    int16_t *attn_read_list;
-    // int *attn_write_list;
-    int16_t *attn_write_list;
-    int16_t *attn_must_do_list;
-    float thr;
-};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -183,13 +174,14 @@ struct Flash_fwd_params : public Qkv_params
     int arch;
     int num_sm;
 
-    // lite attention related
-    QKSkipMaskArgs qk_skip_mask_args;
-    bool is_skipable;
-    bool reverse_skip_list = false;
-    bool phase = false;
-    bool has_must_do_list = false;
-    // ~~~~~~~~~~~~~~~~
+
+    
+    // Per-row tile stats: one float local LSE per (q_row, n_block). Shape: [Batch, Head, SeqQ, N_Block].
+    float *__restrict__ ptr_tile_stats;
+    index_t stride_tile_batch;
+    index_t stride_tile_head;
+    index_t stride_tile_m;
+    index_t stride_tile_n;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -237,6 +229,14 @@ struct Flash_bwd_params : public Flash_fwd_params
 
     bool deterministic;
     index_t dq_accum_split_stride;
+    
+    // Block sparsity mask (backward pass) — column-transposed [B, H, C, R] uint8
+    uint8_t const* ptr_block_mask;
+    int num_row_tiles;
+    int num_col_tiles;
+
+    // Sorted CTA scheduling remap array for block sparsity
+    int32_t const* work_remap = nullptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -1,5 +1,5 @@
 import torch
-from lite_attention import LiteAttention
+from back_lite import BackLite
 
 torch.manual_seed(0)
 torch.cuda.manual_seed(0)
@@ -13,10 +13,9 @@ def init_qkv(head_dim):
 for head_dim in [32, 64, 96, 128, 192, 256]:
     print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
     print(f"head_dim: {head_dim}")
-    attn = LiteAttention()
-    attn.threshold = float(2)
+    attn = BackLite()
     for i in range(2):
         q, k, v = init_qkv(head_dim)
         output = attn(q, k, v)
     torch.cuda.synchronize()
-    print(attn._skip_list.shape)
+    print(f"output shape: {output.shape}")

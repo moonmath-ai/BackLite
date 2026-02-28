@@ -29,6 +29,7 @@ struct TileSchedulerArguments {
     int const* const varlen_batch_idx_ptr = nullptr;
     // int const* const num_n_blocks_ptr = nullptr;
     int const* const num_nheads_in_l2_ptr = nullptr;
+    int32_t const* work_remap = nullptr;  // Sorted CTA scheduling remap array
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -49,6 +50,8 @@ public:
         int const* const cu_seqlens;
         int const* const seqused;
         int const* const num_splits_dynamic_ptr = nullptr;
+        int32_t const* work_remap = nullptr;  // Sorted CTA scheduling
+        cutlass::FastDivmod head_divmod;       // For decoding work_remap
     };
 
     static Params
@@ -59,11 +62,15 @@ public:
                 args.qhead_per_khead, args.seqlen,
                 cutlass::FastDivmod(!Split ? 1 : args.num_splits),
                 !Varlen ? nullptr : args.cu_seqlens, !Varlen ? nullptr : args.seqused,
-                args.num_splits_dynamic_ptr};
+                args.num_splits_dynamic_ptr,
+                args.work_remap, cutlass::FastDivmod(args.num_head)};
     }
 
     static dim3
     get_grid_shape(Params const& params, int num_sm) {
+        if (params.work_remap != nullptr) {
+            return {uint32_t(params.num_blocks * params.num_head * params.num_batch)};
+        }
         return {uint32_t(params.num_blocks), uint32_t((!Split ? 1 : params.num_splits) * params.num_head), uint32_t(params.num_batch)};
     }
 
@@ -94,6 +101,14 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_initial_work(Params const& params) const {
+        if (params.work_remap != nullptr) {
+            int packed = params.work_remap[blockIdx.x];
+            int block_idx = packed & 0xFFFF;
+            int bidhb = packed >> 16;
+            int bidh, bidb;
+            bidb = params.head_divmod.divmod(bidh, bidhb);
+            return {block_idx, bidh, bidb, 0};
+        }
         WorkTileInfo work_info {int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), 0};
         if constexpr (Split) {
             int split_idx;

@@ -7,14 +7,55 @@ import torch.nn as nn
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
-import lite_attention._C # Registers operators with PyTorch
+import back_lite._C # Registers operators with PyTorch
 
 # isort: on
 
-flash_attn_3_cuda = torch.ops.lite_attention
+flash_attn_3_cuda = torch.ops.back_lite
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+# Fused Triton kernel: single-pass mask generation from cumulative LSE.
+from back_lite._internal.tile_stats_reduce import mask_from_stats_fused as _mask_from_stats_fused
+
+
+def _mask_from_stats_compiled(tile_lse, softmax_lse, num_row_tiles, kBlockM_bwd, negl_prob):
+    """Mask generation from cumulative LSE.  Delegates to fused Triton kernel."""
+    return _mask_from_stats_fused(tile_lse, softmax_lse, num_row_tiles, kBlockM_bwd, negl_prob)
+
+
+def _generate_mask_from_stats_mass(tile_stats, seq_q, head_dim, head_dim_v, dtype, negl_prob, is_causal=False, is_local=False, softcap=0.0, device=None, softmax_lse=None):
+    """
+    Generate block sparsity mask from forward per-row tile LSE statistics for backward kernel.
+
+    tile_stats: [batch, head, seq_q, num_n_blocks_fwd], float32 local tile LSE (ln space).
+    softmax_lse: [batch, head, seq_q], float32 — log-sum-exp from FA3 forward (ln space).
+    """
+    if tile_stats.dim() != 4: raise ValueError("tile_stats must have shape [batch, head, seq_q, num_n_blocks_fwd]")
+    batch, head, actual_seq_q, num_n_blocks_fwd = tile_stats.shape
+    tile_lse = tile_stats
+
+    has_softcap = softcap > 0.0
+    element_size = 1 if dtype == torch.int8 else (2 if dtype in (torch.float16, torch.bfloat16) else 4)
+    kBlockM_bwd, kBlockN_bwd = flash_attn_3_cuda.get_tile_size_bwd(
+        head_dim, head_dim_v, is_causal, is_local, has_softcap
+    )
+    tile_info_fwd = flash_attn_3_cuda.get_tile_size_fwd_sm90(
+        head_dim, head_dim_v, is_causal, is_local,
+        element_size, False, False, has_softcap, dtype == torch.int8,
+    )
+    kBlockN_fwd = tile_info_fwd[1]
+
+    num_row_tiles_bwd = (seq_q + kBlockM_bwd - 1) // kBlockM_bwd
+
+    # Validate mask-generation assumptions
+    if softmax_lse is None: raise RuntimeError("Mask generation requires softmax_lse.")
+    if kBlockN_bwd != kBlockN_fwd: raise RuntimeError(f"Mask generation requires matching N tile sizes (bwd={kBlockN_bwd}, fwd={kBlockN_fwd}).")
+    if seq_q != actual_seq_q: raise RuntimeError(f"Mask generation requires seq_q == tile_stats.shape[2] (seq_q={seq_q}, tile_stats_seq_q={actual_seq_q}).")
+    if seq_q % kBlockM_bwd != 0: raise RuntimeError(f"Mask generation requires seq_q divisible by kBlockM_bwd (seq_q={seq_q}, kBlockM_bwd={kBlockM_bwd}).")
+
+    return _mask_from_stats_fused(tile_lse, softmax_lse, num_row_tiles_bwd, kBlockM_bwd, negl_prob).contiguous()
 
 
 def _flash_attn_forward(
@@ -51,13 +92,7 @@ def _flash_attn_forward(
         num_splits=1,
         pack_gqa=None,
         sm_margin=0,
-        # qk_skip_mask_args=None,
-        attn_read_list=None,
-        attn_must_do_list=None,
-        attn_write_list=None,
-        thr=-3.0,
-        reverse_skip_list=False,
-        phase=False
+        tile_stats=None,
     ):
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -105,13 +140,7 @@ def _flash_attn_forward(
         num_splits,
         pack_gqa,
         sm_margin,
-        # qk_skip_mask_args,
-        attn_read_list,
-        attn_must_do_list,
-        attn_write_list,
-        thr=thr,
-        reverse_skip_list=reverse_skip_list,
-        phase=phase,
+        tile_stats=tile_stats,
     )
     return out, softmax_lse, *rest
 
@@ -138,6 +167,7 @@ def _flash_attn_backward(
         softcap=0.0,
         deterministic=False,
         sm_margin=0,
+        block_mask=None,
 ):
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -164,6 +194,7 @@ def _flash_attn_backward(
         softcap,
         deterministic,
         sm_margin,
+        block_mask=block_mask,
     )
     return dq, dk, dv, softmax_d
 
@@ -182,13 +213,6 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         deterministic=False,
         num_heads_q=None,
         sm_margin=0,
-        # qk_skip_mask_args=None,
-        attn_read_list=None,
-        attn_must_do_list=None,
-        attn_write_list=None,
-        thr=-3.0,
-        reverse_skip_list=False,
-        phase=False,
     ):
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -220,16 +244,9 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             attention_chunk=attention_chunk,
             softcap=softcap,
             sm_margin=sm_margin,
-            # qk_skip_mask_args=qk_skip_mask_args,
-            attn_read_list=attn_read_list,
-            attn_must_do_list=attn_must_do_list,
-            attn_write_list=attn_write_list,
-            thr=thr,
-            reverse_skip_list=reverse_skip_list,
-            phase=phase,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        ctx.save_for_backward(q, k, v, out, softmax_lse, *rest)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -243,7 +260,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse = ctx.saved_tensors
+        q, k, v, out, softmax_lse, *_ = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         if ctx.ndim == 5:
             qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
@@ -298,15 +315,32 @@ class FlashAttnFunc(torch.autograd.Function):
         pack_gqa=None,
         deterministic=False,
         sm_margin=0,
-        # qk_skip_mask_args=None,
-        attn_read_list=None,
-        attn_must_do_list=None,
-        attn_write_list=None,
-        thr=-3.0,
         return_softmax_lse=False,
-        reverse_skip_list=False,
-        phase=False,
+        tile_stats=None,
+        negl_prob=0.0,
     ):
+        _sparse_enabled = negl_prob > 0
+        if _sparse_enabled and tile_stats is None:
+            batch, seq_q, heads, head_dim = q.shape
+            fwd_is_local = (window_size[0] >= 0 or window_size[1] >= 0) and not causal
+            result = flash_attn_3_cuda.get_tile_size_fwd_sm90(
+                head_dim, head_dim, causal, fwd_is_local, q.element_size(),
+                False, False, False, (q.dtype == torch.int8)
+            )
+            kBlockM, kBlockN = result[0], result[1]
+            num_n_blocks = (k.shape[1] + kBlockN - 1) // kBlockN
+            # Per-row tile LSE stats: logical shape [batch, heads, seq_q, num_n_blocks].
+            # Must be -inf so causally-masked positions (never written by fwd kernel)
+            # yield exp(-inf)=0 mass instead of garbage from uninitialized memory.
+            #
+            # Allocate as [B,H,N,T] then permute to [B,H,T,N].
+            # This gives stride_m=1 (row dimension is innermost in memory),
+            # so the forward kernel writes are coalesced.
+            tile_stats = torch.full(
+                (batch, heads, num_n_blocks, seq_q), float('-inf'),
+                device=q.device, dtype=torch.float32
+            ).permute(0, 1, 3, 2)  # shape [B,H,T,N], stride_m=1
+
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         # out, q, k, v, out_padded, softmax_lse = _flash_attn_forward(
@@ -331,16 +365,13 @@ class FlashAttnFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
-            # qk_skip_mask_args=qk_skip_mask_args,
-            attn_read_list=attn_read_list,
-            attn_must_do_list=attn_must_do_list,
-            attn_write_list=attn_write_list,
-            thr=thr,
-            reverse_skip_list=reverse_skip_list,
-            phase=phase,
+            tile_stats=tile_stats,
         )
-        # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
+
+        if _sparse_enabled:
+            ctx.save_for_backward(q, k, v, out, softmax_lse, tile_stats, *rest)
+        else:
+            ctx.save_for_backward(q, k, v, out, softmax_lse, *rest)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -348,6 +379,9 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
+        ctx.negl_prob = negl_prob
+        ctx.head_dim_v = v.shape[-1]
+        ctx.q_dtype = q.dtype
         if return_softmax_lse:
             return out, softmax_lse
         else:
@@ -355,7 +389,22 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, softmax_lse = ctx.saved_tensors
+        saved = ctx.saved_tensors
+        # Unpack saved tensors: q, k, v, out, softmax_lse, [tile_stats or None], [*rest]
+        q, k, v, out, softmax_lse = saved[0], saved[1], saved[2], saved[3], saved[4]
+        block_mask = None
+        negl_prob = getattr(ctx, 'negl_prob', 0.0)
+        if negl_prob > 0 and len(saved) > 5:
+            tile_stats = saved[5]
+            # tile_stats: [B, H, seq_q, num_n_blocks] float32
+            if tile_stats is not None and tile_stats.dim() == 4 and tile_stats.dtype == torch.float32:
+                is_local = (ctx.window_size[0] >= 0 or ctx.window_size[1] >= 0) and not ctx.causal
+                block_mask = _generate_mask_from_stats_mass(
+                    tile_stats, q.shape[1], q.shape[-1], ctx.head_dim_v, ctx.q_dtype, negl_prob,
+                    is_causal=ctx.causal, is_local=is_local, softcap=ctx.softcap,
+                    device=q.device, softmax_lse=softmax_lse,
+                )
+
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
@@ -377,11 +426,12 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
+            block_mask=block_mask,
         )
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, *((None,) * 16)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -409,16 +459,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         pack_gqa=None,
         deterministic=False,
         sm_margin=0,
-        # qk_skip_mask_args=None,
-        attn_read_list=None,
-        attn_must_do_list=None,
-        attn_write_list=None,
-        thr=-3.0,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         # out, q, k, v, out_padded, softmax_lse = _flash_attn_varlen_forward(
-        out, softmax_lse, *rest = _flash_attn_forward(
+        out, softmax_lse, *_ = _flash_attn_forward(
             q,
             k,
             v,
@@ -443,11 +488,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
-            # qk_skip_mask_args=None,
-            attn_read_list=attn_read_list,
-            attn_must_do_list=attn_must_do_list,
-            attn_write_list=attn_write_list,
-            thr=thr,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -493,7 +533,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -571,14 +611,9 @@ def flash_attn_func(
     pack_gqa=None,
     deterministic=False,
     sm_margin=0,
-    # qk_skip_mask_args=None,
-    attn_read_list=None,
-    attn_must_do_list=None,
-    attn_write_list=None,
-    thr=-3.0,
     return_softmax_lse=False,
-    reverse_skip_list=False,
-    phase=False,
+    tile_stats=None,
+    negl_prob=0.0,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -640,14 +675,9 @@ def flash_attn_func(
         pack_gqa,
         deterministic,
         sm_margin,
-        # qk_skip_mask_args,
-        attn_read_list,
-        attn_must_do_list,
-        attn_write_list,
-        thr,
         return_softmax_lse,
-        reverse_skip_list,
-        phase,
+        tile_stats,
+        negl_prob,
     )
 
 
@@ -732,11 +762,6 @@ def flash_attn_with_kvcache(
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
-    # qk_skip_mask_args=None,
-    attn_read_list=None,
-    attn_must_do_list=None,
-    attn_write_list=None,
-    thr=-3.0,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -864,11 +889,6 @@ def flash_attn_with_kvcache(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
-        # qk_skip_mask_args=qk_skip_mask_args,
-        attn_read_list=attn_read_list,
-        attn_must_do_list=attn_must_do_list,
-        attn_write_list=attn_write_list,
-        thr=thr,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
