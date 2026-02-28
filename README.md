@@ -27,7 +27,7 @@ BackLite introduces a two-phase mechanism:
 
 $$p_\text{tile} = \exp\!\left(\mathrm{LSE}_\text{tile} - \mathrm{LSE}_\text{row}\right)$$
 
-If $p_\text{tile} < \texttt{negl\_prob}$, the tile is marked as skippable and the backward kernel bypasses it entirely — no memory reads, no FLOPs.
+If $p_\text{tile}$ is less than `negl_prob`, the tile is marked as skippable and the backward kernel bypasses it entirely — no memory reads, no FLOPs.
 
 This approach:
 - Introduces **no approximation in the forward pass**
