@@ -16,23 +16,13 @@ flash_attn_3_cuda = torch.ops.lite_attention
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
-# TODO @tarik: This will be converted to custom kernel, but for now we can use torch.compile to optimize it.
-def _mask_from_stats_compiled(tile_lse, softmax_lse, num_row_tiles, kBlockM_bwd, negl_prob):
-    """Fused mask generation from per-row tile LSE + global softmax_lse. torch.compile friendly."""
-    batch, head, seq_q, num_n_blocks = tile_lse.shape
-    block_power = torch.exp((tile_lse - softmax_lse.unsqueeze(-1)).clamp(min=-80.0, max=80.0))
-    block_power = torch.nan_to_num(block_power, nan=0.0, posinf=0.0, neginf=0.0)
-    tile_power = block_power.reshape(batch, head, num_row_tiles, kBlockM_bwd, num_n_blocks).sum(dim=3)
-    denom = tile_power.sum(-1, keepdim=True).clamp_min(1e-20)
-    tile_power = tile_power / denom
-    vals, idx = torch.sort(tile_power, dim=-1)
-    csum = torch.cumsum(vals, dim=-1)
-    select_sorted = csum < negl_prob
-    ignore_mask = torch.zeros_like(tile_power, dtype=torch.bool)
-    ignore_mask.scatter_(-1, idx, select_sorted)
-    return (~ignore_mask).to(torch.uint8)
+# Fused Triton kernel: single-pass mask generation from cumulative LSE.
+from lite_attention._internal.tile_stats_reduce import mask_from_stats_fused as _mask_from_stats_fused
 
-_mask_from_stats_compiled = torch.compile(_mask_from_stats_compiled, fullgraph=True, mode='reduce-overhead')
+
+def _mask_from_stats_compiled(tile_lse, softmax_lse, num_row_tiles, kBlockM_bwd, negl_prob):
+    """Mask generation from cumulative LSE.  Delegates to fused Triton kernel."""
+    return _mask_from_stats_fused(tile_lse, softmax_lse, num_row_tiles, kBlockM_bwd, negl_prob)
 
 
 def _generate_mask_from_stats_mass(tile_stats, seq_q, head_dim, head_dim_v, dtype, negl_prob, is_causal=False, is_local=False, softcap=0.0, device=None, softmax_lse=None):
@@ -65,7 +55,7 @@ def _generate_mask_from_stats_mass(tile_stats, seq_q, head_dim, head_dim_v, dtyp
     if seq_q != actual_seq_q: raise RuntimeError(f"Mask generation requires seq_q == tile_stats.shape[2] (seq_q={seq_q}, tile_stats_seq_q={actual_seq_q}).")
     if seq_q % kBlockM_bwd != 0: raise RuntimeError(f"Mask generation requires seq_q divisible by kBlockM_bwd (seq_q={seq_q}, kBlockM_bwd={kBlockM_bwd}).")
 
-    return _mask_from_stats_compiled(tile_lse, softmax_lse, num_row_tiles_bwd, kBlockM_bwd, negl_prob).contiguous()
+    return _mask_from_stats_fused(tile_lse, softmax_lse, num_row_tiles_bwd, kBlockM_bwd, negl_prob).contiguous()
 
 
 def _flash_attn_forward(
