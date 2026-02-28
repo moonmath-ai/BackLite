@@ -355,17 +355,25 @@ class FlashAttnFunc(torch.autograd.Function):
         tile_stats=None,
         negl_prob=0.0,
     ):
-        if negl_prob > 0 and tile_stats is None:
+        _sparse_enabled = negl_prob > 0
+        if _sparse_enabled and tile_stats is None:
             batch, seq_q, heads, head_dim = q.shape
+            fwd_is_local = (window_size[0] >= 0 or window_size[1] >= 0) and not causal
             result = flash_attn_3_cuda.get_tile_size_fwd_sm90(
-                head_dim, head_dim, False, False, q.element_size(),
-                False, False, False, True, (q.dtype == torch.int8)
+                head_dim, head_dim, causal, fwd_is_local, q.element_size(),
+                False, False, False, False, (q.dtype == torch.int8)
             )
             kBlockM, kBlockN = result[0], result[1]
             num_n_blocks = (k.shape[1] + kBlockN - 1) // kBlockN
-            # Per-row tile LSE stats: [batch, heads, seq_q, num_n_blocks]
-            tile_stats = torch.empty(
-                batch, heads, seq_q, num_n_blocks,
+            # Per-row tile LSE stats: logical shape [batch, heads, seq_q, num_n_blocks].
+            # Must be -inf so causally-masked positions (never written by fwd kernel)
+            # yield exp(-inf)=0 mass instead of garbage from uninitialized memory.
+            #
+            # Allocate as [B,H,N,T] then permute to [B,H,T,N].
+            # This gives stride_m=1 (row dimension is innermost in memory),
+            # so the forward kernel writes are coalesced.
+            tile_stats = torch.full(
+                (batch, heads, num_n_blocks, seq_q), float('-inf'),
                 device=q.device, dtype=torch.float32
             )
 
@@ -401,23 +409,9 @@ class FlashAttnFunc(torch.autograd.Function):
             tile_stats=tile_stats,
         )
 
-        block_mask = None
-        if negl_prob > 0:
-            if tile_stats is None:
-                raise RuntimeError("tile_stats must be allocated when negl_prob > 0")
-            is_local = (window_size[0] >= 0 or window_size[1] >= 0) and not causal
-            block_mask = _generate_mask_from_stats_mass(
-                tile_stats, q.shape[1], q.shape[-1], v.shape[-1], q.dtype, negl_prob,
-                is_causal=causal, is_local=is_local, softcap=softcap, device=q.device,
-                softmax_lse=softmax_lse,
-            )
-
-        # Save tensors for backward pass
-        # If block_mask exists, save it; otherwise don't save it to avoid issues with empty tensors
-        if block_mask is not None:
-            ctx.save_for_backward(q, k, v, out, softmax_lse, block_mask, *rest)
+        if _sparse_enabled:
+            ctx.save_for_backward(q, k, v, out, softmax_lse, tile_stats, *rest)
         else:
-            # When no mask, save without it (backward will check length)
             ctx.save_for_backward(q, k, v, out, softmax_lse, *rest)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -426,6 +420,9 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
+        ctx.negl_prob = negl_prob
+        ctx.head_dim_v = v.shape[-1]
+        ctx.q_dtype = q.dtype
         if return_softmax_lse:
             return out, softmax_lse
         else:
@@ -434,19 +431,21 @@ class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         saved = ctx.saved_tensors
-        # Unpack saved tensors: q, k, v, out, softmax_lse, [mask_to_save], [*rest]
-        # *rest can contain out_accum, softmax_lse_accum when num_splits > 1
+        # Unpack saved tensors: q, k, v, out, softmax_lse, [tile_stats or None], [*rest]
         q, k, v, out, softmax_lse = saved[0], saved[1], saved[2], saved[3], saved[4]
-        
-        # Check if 6th element is block_mask (4D uint8 tensor)
-        # When block_mask was saved, it's at index 5; when not saved, *rest starts at index 5
         block_mask = None
-        if len(saved) > 5:
-            potential_mask = saved[5]
-            # block_mask is a 4D uint8 tensor [batch, head, num_row_tiles, num_col_tiles]
-            if isinstance(potential_mask, torch.Tensor) and potential_mask.dtype == torch.uint8 and potential_mask.dim() == 4:
-                block_mask = potential_mask
-        
+        negl_prob = getattr(ctx, 'negl_prob', 0.0)
+        if negl_prob > 0 and len(saved) > 5:
+            tile_stats = saved[5]
+            # tile_stats: [B, H, seq_q, num_n_blocks] float32
+            if tile_stats is not None and tile_stats.dim() == 4 and tile_stats.dtype == torch.float32:
+                is_local = (ctx.window_size[0] >= 0 or ctx.window_size[1] >= 0) and not ctx.causal
+                block_mask = _generate_mask_from_stats_mass(
+                    tile_stats, q.shape[1], q.shape[-1], ctx.head_dim_v, ctx.q_dtype, negl_prob,
+                    is_causal=ctx.causal, is_local=is_local, softcap=ctx.softcap,
+                    device=q.device, softmax_lse=softmax_lse,
+                )
+
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(

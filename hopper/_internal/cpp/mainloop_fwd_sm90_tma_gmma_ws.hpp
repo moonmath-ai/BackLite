@@ -41,6 +41,21 @@ namespace flash
 
     using namespace cute;
 
+    // ------------------------------------------------------------------
+    // Streaming store helper — bypasses L2 write-allocate (no read-for-ownership).
+    // Avoids polluting L2 with write-once tile_stats data.
+    // ------------------------------------------------------------------
+    __device__ __forceinline__ void
+    streaming_store_f32(float* addr, float val) {
+        asm volatile("st.global.cs.f32 [%0], %1;" :: "l"((unsigned long long)addr), "f"(val) : "memory");
+    }
+
+    // Vectorized 64-bit streaming store — writes two consecutive floats at once.
+    __device__ __forceinline__ void
+    streaming_store_f32x2(float* addr, float val0, float val1) {
+        asm volatile("st.global.cs.v2.b32 [%0], {%1, %2};" :: "l"((unsigned long long)addr), "f"(val0), "f"(val1) : "memory");
+    }
+
     // Main collective mainloop class for Flash Attention forward pass
     // Template parameters:
     // - Stages: Number of pipeline stages for overlapping compute and memory operations
@@ -684,59 +699,30 @@ namespace flash
         }
 
         // ------------------------------------------------------------------
-        // EPILOGUE: SAVE PER-ROW TILE LSE FOR SPARSITY MASKING
-        // Writes one float (local tile LSE) per query row per N-block to global memory.
-        // Layout: [Batch, Head, seq_q, N_Block].  stride_tile_m = stride per row.
-        // Only one thread per quad (lane 0 mod 4) writes, since all 4 share the same rows.
+        // SAVE CUMULATIVE LSE FOR SPARSITY MASKING
+        //
+        // Per-row: receives already-allreduced row sums
         // ------------------------------------------------------------------
-        template <typename TensorMax, typename TensorSum, typename TensorCoord>
+        template <typename TensorMax, typename TensorSum>
         CUTLASS_DEVICE void
         save_tile_stats_epilogue(
-            Params const& params,
+            float* __restrict__ row_base,
+            int64_t stride_N,
             TensorMax const& row_max,
-            TensorSum const& row_sum_exp,
-            float const row_max_scale,
-            float* /*smem_stats*/,  // unused
-            int m_block,
+            TensorSum const& row_sum_allreduced,
+            float const row_max_scale_log2,
             int n_block,
-            int bidb,
-            int bidh,
-            int thread_idx,
-            int /*num_mma_threads*/,
-            TensorCoord const& tScS_rowcol)
+            int thread_idx)
         {
-            // Only lane 0 of each quad writes (all 4 lanes hold identical row data after Allreduce<4>)
+            // Only quad-leader (lane 0 of each 4-thread quad) writes
             static constexpr int kMmaThreadsPerRow = size<0, 0>(typename TiledMmaQK::AtomLayoutC_TV{});
             if (thread_idx % kMmaThreadsPerRow != 0) return;
 
-            float* out_ptr = params.ptr_tile_stats;
-            int64_t const base_idx =
-                int64_t(bidb) * get<0>(params.stride_tile_stats) +
-                int64_t(bidh) * get<1>(params.stride_tile_stats) +
-                int64_t(n_block) * get<3>(params.stride_tile_stats);
-            int seq_q_limit = static_cast<int>(get<0>(params.shape_Q));
-
-            // if (params.cu_seqlens_q != nullptr) {
-            //     seq_q_limit = params.cu_seqlens_q[bidb + 1] - params.cu_seqlens_q[bidb];
-            // }
-            // if (params.seqused_q != nullptr) {
-            //     int const seqused = params.seqused_q[bidb];
-            //     seq_q_limit = seqused < seq_q_limit ? seqused : seq_q_limit;
-            // }
-
-            #pragma unroll
-            for (int mi = 0; mi < size(row_max); ++mi) {
-                // Compute global row index for this thread-local row
-                int const row_in_tile = get<0>(tScS_rowcol(mi, _0{}));  // row offset within the tile [0, kBlockM)
-                int const global_row = m_block * kBlockM + row_in_tile;
-                if (global_row >= seq_q_limit) { continue; }
-                int64_t const idx = base_idx + int64_t(global_row) * get<2>(params.stride_tile_stats);
-                float const m = row_max(mi);
-                float const s = row_sum_exp(mi);
-                out_ptr[idx] = (m > -1e20f && s > 0.f && s == s)
-                    ? (m * row_max_scale + __logf(s))
-                    : -INFINITY;
-            }
+            // Store tile LSE in log2 domain: val = row_max * scale_log2 + log2(row_sum)
+            // Consumer converts to natural log by multiplying by M_LN2.
+            float const val0 = row_max(0) * row_max_scale_log2 + __log2f(row_sum_allreduced(0));
+            float const val1 = row_max(1) * row_max_scale_log2 + __log2f(row_sum_allreduced(1));
+            streaming_store_f32x2(row_base + int64_t(n_block) * stride_N, val0, val1);
         }
 
         // Main load function: responsible for loading Q, K, V data from global memory to shared memory
@@ -1363,6 +1349,27 @@ namespace flash
                 }
             }
 
+            // Precompute tile-stats row base address once per m_block (invariant across n_blocks).
+            // Only n_block varies per epilogue call, saving ~10 int ops per invocation.
+            float* __restrict__ stats_row_base = nullptr;
+            int64_t stats_stride_N = 0;
+            float stats_scale_log2 = 0.f;
+            if (params.ptr_tile_stats != nullptr) {
+                static constexpr int kMmaThreadsPerRow_s = size<0, 0>(typename TiledMmaQK::AtomLayoutC_TV{});
+                int const wg_idx     = thread_idx / 128;
+                int const warp_in_wg = (thread_idx % 128) / 32;
+                int const lane       = thread_idx % 32;
+                int const group      = lane / kMmaThreadsPerRow_s;
+                int const row0       = wg_idx * 64 + warp_in_wg * 16 + group * 2;
+                int const global_row0 = m_block * kBlockM + row0;
+                stats_stride_N = get<3>(params.stride_tile_stats);
+                stats_scale_log2 = !Is_INT8 ? softmax.softmax_scale_log2 : 1.0f;
+                stats_row_base = params.ptr_tile_stats
+                    + int64_t(bidb) * get<0>(params.stride_tile_stats)
+                    + int64_t(bidh) * get<1>(params.stride_tile_stats)
+                    + int64_t(global_row0) * get<2>(params.stride_tile_stats);
+            }
+
             // int warp_group_idx = __shfl_sync(0xFFFFFFFF, thread_idx / cutlass::NumThreadsPerWarpGroup, 0);
 
             /* DOR: in the video there is this comment here:
@@ -1423,12 +1430,6 @@ namespace flash
             auto wg_mma_qk = tiled_mma_qk.get_slice(warp_group_thread_layout(warp_group_idx));
             auto wg_mma_pv = tiled_mma_pv.get_slice(warp_group_thread_layout(warp_group_idx));
             auto wg_mma_qv = tiled_mma_qv.get_slice(warp_group_thread_layout(warp_group_idx));
-
-            // Coordinate tensor for per-row tile stats: maps thread-local row index to tile-local row index
-            auto thread_mma_stats = tiled_mma_qk.get_thread_slice(thread_idx);
-            Tensor cS_stats = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
-            Tensor tScS_stats = thread_mma_stats.partition_C(cS_stats);
-            Tensor tScS_stats_rowcol = make_tensor(tScS_stats.data(), flash::convert_layout_acc_rowcol(tScS_stats.layout()));
 
             auto smem_tiled_copy_P = make_tiled_copy_C(SmemCopyAtomP{}, tiled_mma_qk);
             auto smem_thr_copy_P = smem_tiled_copy_P.get_thread_slice(thread_idx);
@@ -1657,17 +1658,15 @@ namespace flash
                     softmax.template online_softmax_dequantize</*Is_first=*/true, /*Check_inf=*/true>(tSrS_ambiguous_type, tSrS);
                 }
                 if (params.ptr_tile_stats != nullptr) {
-                    auto row_sum_exp = make_fragment_like(softmax.row_sum);
-                    cute::copy(softmax.row_sum, row_sum_exp);
                     SumOp<float> sum_op;
+                    auto row_sum_ar = make_fragment_like(softmax.row_sum);
+                    cute::copy(softmax.row_sum, row_sum_ar);
                     #pragma unroll
-                    for (int i = 0; i < size(row_sum_exp); ++i) {
-                        row_sum_exp(i) = Allreduce<4>::run(row_sum_exp(i), sum_op);
+                    for (int i = 0; i < size(row_sum_ar); ++i) {
+                        row_sum_ar(i) = Allreduce<4>::run(row_sum_ar(i), sum_op);
                     }
-                    float const row_max_scale = !Is_INT8 ? (softmax.softmax_scale_log2 * float(M_LN2)) : float(M_LN2);
-                    save_tile_stats_epilogue(params, softmax.row_max, row_sum_exp,
-                        row_max_scale, nullptr,
-                        m_block, n_block, bidb, bidh, thread_idx, NumMmaThreadsQK, tScS_stats_rowcol);
+                    save_tile_stats_epilogue(stats_row_base, stats_stride_N, softmax.row_max, row_sum_ar,
+                        stats_scale_log2, n_block, thread_idx);
                 }
                 if constexpr (Is_FP8 && !V_colmajor)
                 {
@@ -1780,21 +1779,19 @@ namespace flash
                         softmax.template online_softmax_dequantize</*Is_first=*/false, Check_inf>(tSrS_ambiguous_type, tSrS);
                     }
                     if (params.ptr_tile_stats != nullptr) {
-                        auto row_sum_exp = make_fragment_like(softmax.row_sum);
-                        cute::copy(softmax.row_sum, row_sum_exp);
+                        auto row_sum_ar = make_fragment_like(softmax.row_sum);
+                        cute::copy(softmax.row_sum, row_sum_ar);
                         #pragma unroll
-                        for (int i = 0; i < size(row_sum_exp); ++i) {
-                            row_sum_exp(i) -= row_sum_prev(i);
+                        for (int i = 0; i < size(row_sum_ar); ++i) {
+                            row_sum_ar(i) -= row_sum_prev(i);
                         }
                         SumOp<float> sum_op;
                         #pragma unroll
-                        for (int i = 0; i < size(row_sum_exp); ++i) {
-                            row_sum_exp(i) = Allreduce<4>::run(row_sum_exp(i), sum_op);
+                        for (int i = 0; i < size(row_sum_ar); ++i) {
+                            row_sum_ar(i) = Allreduce<4>::run(row_sum_ar(i), sum_op);
                         }
-                        float const row_max_scale = !Is_INT8 ? (softmax.softmax_scale_log2 * float(M_LN2)) : float(M_LN2);
-                        save_tile_stats_epilogue(params, softmax.row_max, row_sum_exp,
-                            row_max_scale, nullptr,
-                            m_block, new_n_block, bidb, bidh, thread_idx, NumMmaThreadsQK, tScS_stats_rowcol);
+                        save_tile_stats_epilogue(stats_row_base, stats_stride_N, softmax.row_max, row_sum_ar,
+                            stats_scale_log2, new_n_block, thread_idx);
                     }
                     if constexpr (!HasQv)
                     {
@@ -1984,50 +1981,15 @@ namespace flash
                     }
 
                     auto tSrS = convert_qk_accum_to_float(tSrS_ambiguous_type);
-                    if constexpr (Is_first_iter) {
-                        if constexpr (!Is_INT8){
-                            softmax.template online_softmax<Is_first_iter, Check_inf>(tSrS);
-                        } else {
-                            softmax.template online_softmax_dequantize<Is_first_iter, Check_inf>(tSrS_ambiguous_type, tSrS);
-                        }
-                        if (params.ptr_tile_stats != nullptr) {
-                            auto row_sum_exp = make_fragment_like(softmax.row_sum);
-                            cute::copy(softmax.row_sum, row_sum_exp);
-                            SumOp<float> sum_op;
-                            #pragma unroll
-                            for (int i = 0; i < size(row_sum_exp); ++i) {
-                                row_sum_exp(i) = Allreduce<4>::run(row_sum_exp(i), sum_op);
-                            }
-                            float const row_max_scale = !Is_INT8 ? (softmax.softmax_scale_log2 * float(M_LN2)) : float(M_LN2);
-                            save_tile_stats_epilogue(params, softmax.row_max, row_sum_exp,
-                                row_max_scale, nullptr,
-                                m_block, new_n_block, bidb, bidh, thread_idx, NumMmaThreadsQK, tScS_stats_rowcol);
-                        }
-                    } else {
-                        auto row_sum_prev = make_fragment_like(softmax.row_sum);
+                    // Capture row_sum before softmax for incremental delta (non-first only)
+                    auto row_sum_prev = make_fragment_like(softmax.row_sum);
+                    if constexpr (!Is_first_iter) {
                         cute::copy(softmax.row_sum, row_sum_prev);
-                        if constexpr (!Is_INT8){
-                            softmax.template online_softmax<Is_first_iter, Check_inf>(tSrS);
-                        } else {
-                            softmax.template online_softmax_dequantize<Is_first_iter, Check_inf>(tSrS_ambiguous_type, tSrS);
-                        }
-                        if (params.ptr_tile_stats != nullptr) {
-                            auto row_sum_exp = make_fragment_like(softmax.row_sum);
-                            cute::copy(softmax.row_sum, row_sum_exp);
-                            #pragma unroll
-                            for (int i = 0; i < size(row_sum_exp); ++i) {
-                                row_sum_exp(i) -= row_sum_prev(i);
-                            }
-                            SumOp<float> sum_op;
-                            #pragma unroll
-                            for (int i = 0; i < size(row_sum_exp); ++i) {
-                                row_sum_exp(i) = Allreduce<4>::run(row_sum_exp(i), sum_op);
-                            }
-                            float const row_max_scale = !Is_INT8 ? (softmax.softmax_scale_log2 * float(M_LN2)) : float(M_LN2);
-                            save_tile_stats_epilogue(params, softmax.row_max, row_sum_exp,
-                                row_max_scale, nullptr,
-                                m_block, new_n_block, bidb, bidh, thread_idx, NumMmaThreadsQK, tScS_stats_rowcol);
-                        }
+                    }
+                    if constexpr (!Is_INT8){
+                        softmax.template online_softmax<Is_first_iter, Check_inf>(tSrS);
+                    } else {
+                        softmax.template online_softmax_dequantize<Is_first_iter, Check_inf>(tSrS_ambiguous_type, tSrS);
                     }
 
                     if constexpr (Is_FP8 && !V_colmajor)
@@ -2074,6 +2036,26 @@ namespace flash
                     if constexpr (!MmaPV_is_RS && MmaPV_use_RS_WG1)
                     {
                         arrive_on_P_write_barrier();
+                    }
+
+                    // Tile stats: compute and write AFTER PV GEMM issuance
+                    // so allreduce/logf/stores overlap with async GMMA execution
+                    if (params.ptr_tile_stats != nullptr) {
+                        auto row_sum_ar = make_fragment_like(softmax.row_sum);
+                        cute::copy(softmax.row_sum, row_sum_ar);
+                        if constexpr (!Is_first_iter) {
+                            #pragma unroll
+                            for (int i = 0; i < size(row_sum_ar); ++i) {
+                                row_sum_ar(i) -= row_sum_prev(i);
+                            }
+                        }
+                        SumOp<float> sum_op;
+                        #pragma unroll
+                        for (int i = 0; i < size(row_sum_ar); ++i) {
+                            row_sum_ar(i) = Allreduce<4>::run(row_sum_ar(i), sum_op);
+                        }
+                        save_tile_stats_epilogue(stats_row_base, stats_stride_N, softmax.row_max, row_sum_ar,
+                            stats_scale_log2, new_n_block, thread_idx);
                     }
 
                     warpgroup_wait<0>();
