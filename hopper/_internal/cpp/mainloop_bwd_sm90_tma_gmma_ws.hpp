@@ -320,7 +320,7 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
-        // Block sparsity mask
+        // Block sparsity mask — column-transposed [B, H, C, R] uint8
         uint8_t const* const ptr_block_mask = nullptr;
         int const num_row_tiles = 0;
         int const num_col_tiles = 0;
@@ -354,7 +354,7 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
-        // Block sparsity mask
+        // Block sparsity mask — column-transposed [B, H, C, R] uint8
         uint8_t const* const ptr_block_mask = nullptr;
         int const num_row_tiles = 0;
         int const num_col_tiles = 0;
@@ -427,6 +427,30 @@ struct CollectiveMainloopBwdSm90 {
         cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
     }
 
+    // ── Block-sparsity mask helpers ────────────────────────────────────────
+    // Returns pointer to the mask column for n_block, or nullptr when no mask.
+    // Mask layout is [B, H, C, R] (column-major) — stride-1 along R dimension.
+    CUTLASS_DEVICE static uint8_t const*
+    get_mask_col(Params const& params, int bidb, int bidh, int n_block) {
+        if (params.ptr_block_mask == nullptr) return nullptr;
+        int num_heads = get<2>(params.shape_Q);
+        return params.ptr_block_mask
+            + (int64_t(bidb) * num_heads + bidh) * params.num_col_tiles * params.num_row_tiles
+            + n_block * params.num_row_tiles;
+    }
+
+    // Advance to the next active m-block by scanning mask bytes from position m.
+    // mask_col == nullptr means no mask → every tile is active (return m).
+    __device__ static __forceinline__ int
+    next_active_m(uint8_t const* __restrict__ mask_col, int m, int m_end) {
+        if (mask_col == nullptr) return m;        // no mask → dense path
+        #pragma unroll 1
+        for (int i = m; i < m_end; ++i) {
+            if (__ldg(&mask_col[i])) return i;    // read-only texture cache
+        }
+        return m_end;
+    }
+
     template <typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
     load(Params const& params,
@@ -454,23 +478,11 @@ struct CollectiveMainloopBwdSm90 {
                 return;
             }
         }
-        uint8_t const* mask_ptr_base = nullptr;
-        if (params.ptr_block_mask != nullptr) {
-            int64_t offset = (int64_t(bidb) * get<2>(params.shape_Q) + bidh) * (params.num_row_tiles * params.num_col_tiles);
-            mask_ptr_base = params.ptr_block_mask + offset;
-        }
-        if (mask_ptr_base != nullptr) {
-            bool has_any_active = false;
-            for (int m = m_block_min; m < m_block_max; ++m) {
-                if (mask_ptr_base[m * params.num_col_tiles + n_block] != 0) {
-                    has_any_active = true;
-                    break;
-                }
-            }
-            if (!has_any_active) {
-                scheduler_prefetch();
-                return;
-            }
+        auto mask_col = get_mask_col(params, bidb, bidh, n_block);
+        int m_block_first = next_active_m(mask_col, m_block_min, m_block_max);
+        if (m_block_first >= m_block_max) {
+            scheduler_prefetch();
+            return;
         }
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
@@ -530,14 +542,7 @@ struct CollectiveMainloopBwdSm90 {
             }
         }
 
-        auto next_active_m = [&](int start, int end) {
-            if (mask_ptr_base == nullptr) { return start < end ? start : end; }
-            for (int m = start; m < end; ++m) {
-                if (mask_ptr_base[m * params.num_col_tiles + n_block] != 0) { return m; }
-            }
-            return end;
-        };
-        int m_block = next_active_m(m_block_min, m_block_max);
+        int m_block = m_block_first;
 
         int lane_predicate = cute::elect_one_sync();
 
@@ -568,15 +573,14 @@ struct CollectiveMainloopBwdSm90 {
                 copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
                      gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
                 if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
-                int const m_next = next_active_m(m_block + 1, m_block_max);
+                m_block = next_active_m(mask_col, m_block + 1, m_block_max);
                 ++smem_pipe_write;
-                if (m_next >= m_block_max) { break; }
+                if (m_block >= m_block_max) { break; }
                 pipeline_q.producer_acquire(smem_pipe_write);
                 copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
-                     tQgQ(_, m_next), tQsQ(_, smem_pipe_write.index()));
+                     tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
                 copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
-                     gLSE(_, m_next), sLSE(_, smem_pipe_write.index()));
-                m_block = m_next;
+                     gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
             }
         }
         scheduler_prefetch();
@@ -636,28 +640,8 @@ struct CollectiveMainloopBwdSm90 {
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return; }
         }
-        uint8_t const* mask_ptr_base = nullptr;
-        if (params.ptr_block_mask != nullptr) {
-            int64_t offset = (int64_t(bidb) * get<2>(params.shape_Q) + bidh) * (params.num_row_tiles * params.num_col_tiles);
-            mask_ptr_base = params.ptr_block_mask + offset;
-        }
-        bool has_any_active = true;
-        if (mask_ptr_base != nullptr) {
-            has_any_active = false;
-            for (int m = m_block_min; m < m_block_max; ++m) {
-                if (mask_ptr_base[m * params.num_col_tiles + n_block] != 0) {
-                    has_any_active = true;
-                    break;
-                }
-            }
-        }
-        auto next_active_m = [&](int start, int end) {
-            if (mask_ptr_base == nullptr) { return start < end ? start : end; }
-            for (int m = start; m < end; ++m) {
-                if (mask_ptr_base[m * params.num_col_tiles + n_block] != 0) { return m; }
-            }
-            return end;
-        };
+        auto mask_col = get_mask_col(params, bidb, bidh, n_block);
+        int m_block = next_active_m(mask_col, m_block_min, m_block_max);
 
         Tensor sdQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_dqacc.data()), SmemLayoutdQaccum{});
         static constexpr int dQ_TMA_num_bytes = CUTE_STATIC_V(size<0>(sdQ)) * sizeof(ElementAccum);
@@ -673,29 +657,29 @@ struct CollectiveMainloopBwdSm90 {
         int *lock_ptr = !Deterministic ? nullptr : params.dq_semaphore + bidb * num_head + bidh;
         using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>;
         bool const lane_predicate = cute::elect_one_sync();
-        int m_block = m_block_min;
-        if (!has_any_active) {
+
+        if (m_block >= m_block_max) {
+            // No active tiles — handle deterministic barriers if needed
             if constexpr (Deterministic) {
                 #pragma unroll 2
-                for (; m_block < m_block_max; ++m_block) {
-                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
-                    Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
+                for (int m = m_block_min; m < m_block_max; ++m) {
+                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m * num_batch * num_head, n_block);
+                    Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m * num_batch * num_head);
                 }
                 if constexpr (Is_local) {
                     constexpr int kBlockM = get<0>(TileShape_MNK{});
                     int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
                     #pragma unroll 2
-                    for (; m_block < m_block_global_max; ++m_block) {
-                        Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
+                    for (int m = m_block_max; m < m_block_global_max; ++m) {
+                        Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m * num_batch * num_head);
                     }
                 }
             }
             return;
         }
         if constexpr (!Deterministic) {
-            m_block = next_active_m(m_block, m_block_max);
-            #pragma unroll 2
-            for (; m_block < m_block_max; m_block = next_active_m(m_block + 1, m_block_max)) {
+            CUTLASS_PRAGMA_NO_UNROLL
+            while (m_block < m_block_max) {
                 #pragma unroll
                 for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
                     cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);  // sdQ full, to be written to gmem
@@ -709,40 +693,42 @@ struct CollectiveMainloopBwdSm90 {
                     if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(warpgroup_idx)>(); }
                     cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);  // sdQ empty, ready to be written to
                 });
+                m_block = next_active_m(mask_col, m_block + 1, m_block_max);
             }
             return;
         }
+        // Deterministic: iterate ALL m-blocks for barrier ordering, check mask per tile
         #pragma unroll 2
-        for (; m_block < m_block_max; ++m_block) {
-            bool const is_block_active = mask_ptr_base == nullptr || mask_ptr_base[m_block * params.num_col_tiles + n_block] != 0;
+        for (int m_blk = m_block_min; m_blk < m_block_max; ++m_blk) {
+            bool const is_block_active = mask_col == nullptr || mask_col[m_blk] != 0;
             if constexpr (Deterministic) {
-                Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
+                Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_blk * num_batch * num_head, n_block);
             }
             if (is_block_active) {
                 #pragma unroll
                 for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
-                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);  // sdQ full, to be written to gmem
+                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);
                     if (lane_predicate) {
-                        SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                        SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_blk).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
                         tma_store_arrive();
                     }
                 }
                 // Note, the for_each() function is required here to ensure `warpgroup_idx` is of type Int<x>.
                 for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto warpgroup_idx) {
                     if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(warpgroup_idx)>(); }
-                    cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);  // sdQ empty, ready to be written to
+                    cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);
                 });
             }
             if constexpr (Deterministic) {
-                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
+                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_blk * num_batch * num_head);
             }
         }
         if constexpr (Is_local && Deterministic) {
             constexpr int kBlockM = get<0>(TileShape_MNK{});
             int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
             #pragma unroll 2
-            for (; m_block < m_block_global_max; ++m_block) {
-                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
+            for (int m = m_block_max; m < m_block_global_max; ++m) {
+                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m * num_batch * num_head);
             }
         }
     }
@@ -894,31 +880,10 @@ struct CollectiveMainloopBwdSm90 {
             params.attention_chunk_divmod, params.qhead_per_khead_divmod
         );
 
-        // Block sparsity mask setup
-        uint8_t const* mask_ptr_base = nullptr;
-        if (params.ptr_block_mask != nullptr) {
-            int64_t offset = (int64_t(bidb) * get<2>(params.shape_Q) + bidh) * (params.num_row_tiles * params.num_col_tiles);
-            mask_ptr_base = params.ptr_block_mask + offset;
-        }
-        if (mask_ptr_base != nullptr) {
-            bool has_any_active = false;
-            for (int m = m_block_min; m < m_block_max; ++m) {
-                if (mask_ptr_base[m * params.num_col_tiles + n_block] != 0) {
-                    has_any_active = true;
-                    break;
-                }
-            }
-            if (!has_any_active) { return false; }
-        }
-        auto next_active_m = [&](int start, int end) {
-            if (mask_ptr_base == nullptr) { return start < end ? start : end; }
-            for (int m = start; m < end; ++m) {
-                if (mask_ptr_base[m * params.num_col_tiles + n_block] != 0) { return m; }
-            }
-            return end;
-        };
-
-        int m_block = m_block_min;
+        // Block sparsity — byte-pointer for next-active-m scanning
+        auto mask_col = get_mask_col(params, bidb, bidh, n_block);
+        int m_block = next_active_m(mask_col, m_block_min, m_block_max);
+        if (m_block >= m_block_max) { return false; }
 
         clear(tdKrdK);
         clear(tdVrdV);
@@ -1112,12 +1077,11 @@ struct CollectiveMainloopBwdSm90 {
             static constexpr int kBlockM = get<0>(TileShape_MNK{});
             int const m_block_masking_max = ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1;
             int const m_block_end = std::min(m_block_max, m_block_masking_max);
-            m_block = next_active_m(m_block, m_block_end);
             CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block < m_block_end; m_block = next_active_m(m_block + 1, m_block_end)) {
+            while (m_block < m_block_end) {
                 bwd_step(m_block, mask_fn);
+                m_block = next_active_m(mask_col, m_block + 1, m_block_max);
             }
-            m_block = m_block_end;
         }
 
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -1127,19 +1091,18 @@ struct CollectiveMainloopBwdSm90 {
             : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
 
         auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
-        m_block = next_active_m(m_block, m_block_max_before_local_mask);
         CUTLASS_PRAGMA_NO_UNROLL
-        for (; m_block < m_block_max_before_local_mask; m_block = next_active_m(m_block + 1, m_block_max_before_local_mask)) {
+        while (m_block < m_block_max_before_local_mask) {
             bwd_step(m_block, mask_fn);
+            m_block = next_active_m(mask_col, m_block + 1, m_block_max);
         }
-        m_block = m_block_max_before_local_mask;
 
         if constexpr (Is_local && SeparateMaskingIterations) {
             auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
-            m_block = next_active_m(m_block, m_block_max);
             CUTLASS_PRAGMA_NO_UNROLL
-            for (; m_block < m_block_max; m_block = next_active_m(m_block + 1, m_block_max)) {
+            while (m_block < m_block_max) {
                 bwd_step(m_block, mask_fn);
+                m_block = next_active_m(mask_col, m_block + 1, m_block_max);
             }
         }
 

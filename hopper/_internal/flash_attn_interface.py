@@ -375,7 +375,7 @@ class FlashAttnFunc(torch.autograd.Function):
             tile_stats = torch.full(
                 (batch, heads, num_n_blocks, seq_q), float('-inf'),
                 device=q.device, dtype=torch.float32
-            )
+            ).permute(0, 1, 3, 2)  # shape [B,H,T,N], stride_m=1
 
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
