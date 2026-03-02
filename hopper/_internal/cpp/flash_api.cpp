@@ -3,6 +3,7 @@
  ******************************************************************************/
 
  #include <Python.h>
+ #include <cstdlib>
  #include <torch/nn/functional/padding.h>
  #include <ATen/cuda/CUDAContextLight.h>
  #include <c10/cuda/CUDAGuard.h>
@@ -42,6 +43,21 @@
  #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
  
  #define PREPARE_VARLEN_MAX_BATCHES_1CTA 992
+
+ namespace {
+int bwd_sorted_remap_min_col_tiles() {
+    static int min_col_tiles = []() {
+        constexpr int kDefaultMinColTiles = 256;
+        const char* env = std::getenv("BACK_LITE_BWD_SORT_REMAP_MIN_COL_TILES");
+        if (env == nullptr) { return kDefaultMinColTiles; }
+        char* endptr = nullptr;
+         long parsed = std::strtol(env, &endptr, 10);
+         if (endptr == env || parsed < 0 || parsed > 32767) { return kDefaultMinColTiles; }
+         return static_cast<int>(parsed);
+     }();
+     return min_col_tiles;
+ }
+ }  // namespace
  
  void set_params_fprop(Flash_fwd_params &params,
                        // sizes
@@ -1658,22 +1674,26 @@ inline std::tuple<int, int> tile_size_bwd(int arch, int head_size_rounded, bool 
         block_mask_T = block_mask.permute({0, 1, 3, 2}).contiguous();
         params.ptr_block_mask = static_cast<uint8_t const*>(block_mask_T.data_ptr());
 
-        // Sorted CTA scheduling: sort columns by active row count within each
-        // (batch, head) slice, keeping heads contiguous to preserve L2 locality.
-        // block_mask is [B, H, num_m, num_n].  Sum over m → [B, H, num_n].
-        int num_n = block_mask.size(3);
-        int bh = block_mask.size(0) * block_mask.size(1);  // B * H
-        auto active_count = block_mask.to(torch::kFloat32).sum(/*dim=*/2);  // [B, H, num_n]
-        // Sort within each (B, H) slice along dim=-1 (column dimension)
-        auto sorted_result = active_count.reshape({bh, num_n}).sort(/*dim=*/1, /*descending=*/true);
-        auto sorted_col_idx = std::get<1>(sorted_result);  // [B*H, num_n] — column indices per head
-        // Build bidhb index: [B*H, num_n] where each row has the same bidhb value
-        auto bidhb_range = torch::arange(bh, block_mask.options().dtype(torch::kLong))
-                               .unsqueeze(1).expand({bh, num_n});
-        // Pack: upper 16 bits = bidhb, lower 16 bits = n_block
-        auto packed = bidhb_range.to(torch::kInt32) * 65536 + sorted_col_idx.to(torch::kInt32);
-        work_remap_tensor = packed.reshape({-1}).contiguous();
-        params.work_remap = work_remap_tensor.data_ptr<int32_t>();
+        if (params.num_col_tiles >= bwd_sorted_remap_min_col_tiles()) {
+            // Sorted CTA scheduling: sort columns by active row count within each
+            // (batch, head) slice, keeping heads contiguous to preserve L2 locality.
+            // block_mask is [B, H, num_m, num_n].  Sum over m → [B, H, num_n].
+            int num_n = block_mask.size(3);
+            int bh = block_mask.size(0) * block_mask.size(1);  // B * H
+            auto active_count = block_mask.to(torch::kFloat32).sum(/*dim=*/2);  // [B, H, num_n]
+            // Sort within each (B, H) slice along dim=-1 (column dimension)
+            auto sorted_result = active_count.reshape({bh, num_n}).sort(/*dim=*/1, /*descending=*/true);
+            auto sorted_col_idx = std::get<1>(sorted_result);  // [B*H, num_n] — column indices per head
+            // Build bidhb index: [B*H, num_n] where each row has the same bidhb value
+            auto bidhb_range = torch::arange(bh, block_mask.options().dtype(torch::kLong))
+                                   .unsqueeze(1).expand({bh, num_n});
+            // Pack: upper 16 bits = bidhb, lower 16 bits = n_block
+            auto packed = bidhb_range.to(torch::kInt32) * 65536 + sorted_col_idx.to(torch::kInt32);
+            work_remap_tensor = packed.reshape({-1}).contiguous();
+            params.work_remap = work_remap_tensor.data_ptr<int32_t>();
+        } else {
+            params.work_remap = nullptr;
+        }
     } else {
         params.ptr_block_mask = nullptr;
         params.num_row_tiles = 0;
