@@ -51,7 +51,7 @@ using namespace cute; // Import CuTe namespace for tensor operations and layout 
  */
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
-          bool PackGQA, bool Split, bool V_colmajor>
+          bool PackGQA, bool Split, bool V_colmajor, bool SaveTileStats>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream)
 {
     // Compile-time validation of template parameter combinations
@@ -127,7 +127,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream)
             IntraWGOverlap,      // 1
             PackGQA,             // 0
             Split,               // 0
-            V_colmajor>,         // 0
+            V_colmajor,          // 0
+            SaveTileStats>,      // compile-time tile_stats path
         // SM80-89 mainloop: Traditional warp-level cooperation with manual shared memory management
         flash::CollectiveMainloopFwdSm80<kNWarps, kStages, Q_in_regs, TileShape_MNK, kHeadDimV, Element, float, cutlass::arch::Sm80,
                                          Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV, PackGQA, Split>>;
@@ -394,7 +395,9 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream)
                             // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                             CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
                                 static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
-                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor>(params, stream);
+                                BOOL_SWITCH(params.ptr_tile_stats != nullptr, SaveTileStats, [&] {
+                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, SaveTileStats>(params, stream);
+                                });
                             });
                     });
                 });

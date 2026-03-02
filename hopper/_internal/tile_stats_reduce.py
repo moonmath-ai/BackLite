@@ -34,9 +34,8 @@ def _next_power_of_2(n: int) -> int:
 # ══════════════════════════════════════════════════════════════════════════
 # Kernel 1: Reduce BLOCK_M rows → tile_mass[N] per (batch-head, tile)
 #
-# Vectorizes over BLOCK_M=128 rows (coalesced for stride_row=1 layout).
-# Loops over N blocks. Each per-block LSE gives independent probability mass.
-# Writes tile_mass scalars to a scratch buffer for kernel 2.
+# Processes [BLOCK_M, BLOCK_N] 2D tile
+# Writes tile_mass vectors to a scratch buffer for kernel 2.
 # ══════════════════════════════════════════════════════════════════════════
 @triton.jit
 def _reduce_tile_mass_kernel(
@@ -54,6 +53,7 @@ def _reduce_tile_mass_kernel(
     stride_slse_row,
     N_ACTUAL,
     BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     N_PAD: tl.constexpr,
     Tm: tl.constexpr,
 ):
@@ -87,21 +87,29 @@ def _reduce_tile_mass_kernel(
         softmax_lse_ptr + slse_base + safe_rows * stride_slse_row
     ) * LOG2E_C  # [BLOCK_M], pre-converted to log2
 
-    # ── N-major loop ──────────────────────────────────────────
-    for n in range(N_ACTUAL):
-        lse = tl.load(
-            tile_lse_ptr + lse_base + rows * stride_lse_row + n * stride_lse_n,
-            mask=valid_rows, other=float('-inf')
-        )  # [BLOCK_M]
+    # ── N-major loop (2D vectorized: BLOCK_N n-blocks per iter) ──
+    n_base_offs = tl.arange(0, BLOCK_N)  # [BLOCK_N]
 
-        # Per-row probability mass for block n:
+    for n_start in range(0, N_PAD, BLOCK_N):
+        n_offs = n_start + n_base_offs            # [BLOCK_N]
+        valid_n = n_offs < N_ACTUAL
+
+        # Load [BLOCK_M, BLOCK_N] tile — rows are coalesced (stride_row=1)
+        ptrs = (tile_lse_ptr + lse_base
+                + rows[:, None] * stride_lse_row
+                + n_offs[None, :] * stride_lse_n)
+        lse = tl.load(ptrs,
+                       mask=valid_rows[:, None] & valid_n[None, :],
+                       other=float('-inf'))
+
+        # Per-row probability mass for BLOCK_N blocks:
         #   mass(r, n) = exp2(per_block_lse[r, n] - total_lse[r] * log2e)
-        row_mass = tl.exp2(lse - slse_log2)
-        row_mass = tl.where(valid_rows, row_mass, 0.0)
+        row_mass = tl.exp2(lse - slse_log2[:, None])
+        row_mass = tl.where(valid_rows[:, None], row_mass, 0.0)
 
-        # Reduce across BLOCK_M rows → scalar tile_mass[n]
-        mass_n = tl.sum(row_mass)
-        tl.store(scratch_ptr + scratch_base + n, mass_n)
+        # Reduce across BLOCK_M rows → [BLOCK_N] tile_mass values
+        mass = tl.sum(row_mass, axis=0)
+        tl.store(scratch_ptr + scratch_base + n_offs, mass, mask=valid_n)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -219,6 +227,7 @@ def mask_from_stats_fused(
         stride_slse_row=stride_slse_row,
         N_ACTUAL=N,
         BLOCK_M=kBlockM_bwd,
+        BLOCK_N=min(64, N_PAD),
         N_PAD=N_PAD,
         Tm=Tm,
         num_warps=4,
