@@ -142,6 +142,7 @@ class BackLite:
             return_softmax_lse=return_softmax_lse,
             tile_stats=tile_stats,
             negl_prob=self.negl_prob,
+            **_kwargs,
         )
         return output
 
