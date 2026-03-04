@@ -1,6 +1,6 @@
 # Copyright (c) 2023, Tri Dao.
 
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -197,6 +197,201 @@ def _flash_attn_backward(
         block_mask=block_mask,
     )
     return dq, dk, dv, softmax_d
+
+
+# ---------------------------------------------------------------------------
+# torch.compile-compatible custom ops
+# These replace FlashAttnFunc (torch.autograd.Function) for the flash_attn_func
+# path so that torch.compile can include them in compiled graphs without
+# triggering graph breaks or recompilations.
+# ---------------------------------------------------------------------------
+
+@torch.library.custom_op("back_lite::_flash_attn_fwd", mutates_args=(), device_types="cuda")
+def _back_lite_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    num_splits: int,
+    deterministic: bool,
+    sm_margin: int,
+    negl_prob: float,
+    block_n_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Returns (out, softmax_lse, tile_stats).
+    tile_stats has shape (B, H, T, N_k) when negl_prob > 0, else shape (0,) empty placeholder.
+    """
+    _sparse = negl_prob > 0.0
+    if _sparse:
+        batch, seq_q, heads, head_dim = q.shape
+        num_n_blocks = (k.shape[1] + block_n_size - 1) // block_n_size
+        tile_stats: Optional[torch.Tensor] = torch.full(
+            (batch, heads, num_n_blocks, seq_q), float('-inf'),
+            device=q.device, dtype=torch.float32,
+        ).permute(0, 1, 3, 2).contiguous()  # [B,H,T,N] with stride_m=1
+    else:
+        tile_stats = None
+
+    out, softmax_lse, *_ = _flash_attn_forward(
+        q, k, v,
+        None, None,        # k_new, v_new
+        None,              # qv
+        None,              # out
+        None, None, None,  # cu_seqlens_q/k/k_new
+        None, None,        # seqused_q/k
+        None, None,        # max_seqlen_q/k
+        None, None, None,  # page_table, kv_batch_idx, leftpad_k
+        None, None, None,  # rotary_cos/sin, seqlens_rotary
+        None, None, None,  # q/k/v_descale
+        softmax_scale,
+        causal=causal,
+        window_size=(window_size_left, window_size_right),
+        softcap=softcap,
+        num_splits=num_splits,
+        sm_margin=sm_margin,
+        tile_stats=tile_stats,
+    )
+
+    if _sparse:
+        return out, softmax_lse, tile_stats
+    else:
+        return out, softmax_lse, q.new_empty(0)
+
+
+@torch.library.register_fake("back_lite::_flash_attn_fwd")
+def _back_lite_fwd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    num_splits: int,
+    deterministic: bool,
+    sm_margin: int,
+    negl_prob: float,
+    block_n_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, T, H, D = q.shape
+    Dv = v.shape[-1]
+    out = torch.empty((B, T, H, Dv), dtype=q.dtype, device=q.device)
+    softmax_lse = torch.empty((B, H, T), dtype=torch.float32, device=q.device)
+    if negl_prob > 0.0:
+        Nk = (T + block_n_size - 1) // block_n_size
+        tile_stats = torch.empty((B, H, T, Nk), dtype=torch.float32, device=q.device)
+    else:
+        tile_stats = q.new_empty(0)
+    return out, softmax_lse, tile_stats
+
+
+@torch.library.custom_op("back_lite::_flash_attn_bwd", mutates_args=(), device_types="cuda")
+def _back_lite_bwd(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    tile_stats: torch.Tensor,  # (B,H,T,Nk) or shape (0,) when dense
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    deterministic: bool,
+    sm_margin: int,
+    negl_prob: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    block_mask = None
+    if negl_prob > 0.0 and tile_stats.dim() == 4:
+        is_local = (window_size_left >= 0 or window_size_right >= 0) and not causal
+        block_mask = _generate_mask_from_stats_mass(
+            tile_stats, q.shape[1], q.shape[-1], v.shape[-1], q.dtype, negl_prob,
+            is_causal=causal, is_local=is_local, softcap=softcap,
+            device=q.device, softmax_lse=softmax_lse,
+        )
+
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    _flash_attn_backward(
+        dout, q, k, v, out, softmax_lse,
+        None, None,        # cu_seqlens_q/k
+        None, None,        # seqused_q/k
+        None, None,        # max_seqlen_q/k
+        dq, dk, dv,
+        softmax_scale, causal,
+        (window_size_left, window_size_right),
+        softcap, deterministic, sm_margin,
+        block_mask=block_mask,
+    )
+    dq = dq[..., :q.shape[-1]]
+    dk = dk[..., :k.shape[-1]]
+    dv = dv[..., :v.shape[-1]]
+    return dq, dk, dv
+
+
+@torch.library.register_fake("back_lite::_flash_attn_bwd")
+def _back_lite_bwd_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    tile_stats: torch.Tensor,
+    softmax_scale: float,
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    softcap: float,
+    deterministic: bool,
+    sm_margin: int,
+    negl_prob: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+
+def _back_lite_setup_context(ctx, inputs, output):
+    (q, k, v,
+     softmax_scale, causal,
+     window_size_left, window_size_right,
+     softcap, num_splits, deterministic, sm_margin,
+     negl_prob, block_n_size) = inputs
+    out, softmax_lse, tile_stats = output
+    ctx.save_for_backward(q, k, v, out, softmax_lse, tile_stats)
+    ctx.softmax_scale = softmax_scale
+    ctx.causal = causal
+    ctx.window_size_left = window_size_left
+    ctx.window_size_right = window_size_right
+    ctx.softcap = softcap
+    ctx.deterministic = deterministic
+    ctx.sm_margin = sm_margin
+    ctx.negl_prob = negl_prob
+
+
+def _back_lite_backward(ctx, dout, *grads):
+    q, k, v, out, softmax_lse, tile_stats = ctx.saved_tensors
+    dq, dk, dv = _back_lite_bwd(
+        dout, q, k, v, out, softmax_lse, tile_stats,
+        ctx.softmax_scale, ctx.causal,
+        ctx.window_size_left, ctx.window_size_right,
+        ctx.softcap, ctx.deterministic, ctx.sm_margin, ctx.negl_prob,
+    )
+    # 13 inputs → gradients for q, k, v + None for 10 scalar params
+    return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+
+
+_back_lite_fwd.register_autograd(
+    _back_lite_backward, setup_context=_back_lite_setup_context
+)
 
 
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
@@ -660,6 +855,41 @@ def flash_attn_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+    # Fast path: use compile-transparent custom_op when no exotic kwargs are needed.
+    # Fall back to legacy FlashAttnFunc (torch.autograd.Function) for rare features.
+    _use_fast_path = (
+        qv is None
+        and q_descale is None and k_descale is None and v_descale is None
+        and attention_chunk == 0
+        and pack_gqa is None
+    )
+    if _use_fast_path:
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+
+        # Determine kBlockN for tile_stats shape (needed only when sparse).
+        if negl_prob > 0.0:
+            fwd_is_local = (window_size[0] >= 0 or window_size[1] >= 0) and not causal
+            tile_info = flash_attn_3_cuda.get_tile_size_fwd_sm90(
+                q.shape[-1], v.shape[-1], causal, fwd_is_local,
+                q.element_size(), False, False, softcap > 0.0, (q.dtype == torch.int8),
+            )
+            block_n_size = int(tile_info[1])
+        else:
+            block_n_size = 64  # placeholder; tile_stats unused in dense path
+
+        out, softmax_lse_out, _ = _back_lite_fwd(
+            q, k, v,
+            softmax_scale, causal,
+            window_size[0], window_size[1],
+            softcap, num_splits, deterministic, sm_margin,
+            negl_prob, block_n_size,
+        )
+        if return_softmax_lse:
+            return out, softmax_lse_out
+        return out
+
+    # Legacy path (rare kwargs: qv, descale, attention_chunk, pack_gqa).
     return FlashAttnFunc.apply(
         q,
         k,
