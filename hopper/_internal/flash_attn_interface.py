@@ -345,7 +345,7 @@ def _back_lite_fwd_fake(
     softmax_lse = torch.empty((B, H, T), dtype=torch.float32, device=q.device)
     if negl_prob > 0.0:
         Nk = (T + block_n_size - 1) // block_n_size
-        tile_stats = torch.empty((B, H, T, Nk), dtype=torch.float32, device=q.device)
+        tile_stats = torch.empty((B, H, Nk, T), dtype=torch.float32, device=q.device).permute(0, 1, 3, 2)
     else:
         tile_stats = q.new_empty(0)
     return out, softmax_lse, tile_stats
