@@ -15,7 +15,7 @@ import torch
 import math
 from typing import Optional, Tuple, Union
 
-from ._internal.flash_attn_interface import flash_attn_func
+from ._internal.flash_attn_interface import flash_attn_func, compute_sparsity
 
 # Import the C++ extension to register operators with PyTorch
 import back_lite._C  # noqa: F401

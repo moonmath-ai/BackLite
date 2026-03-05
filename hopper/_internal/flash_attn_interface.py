@@ -2,6 +2,7 @@
 
 from typing import Optional, Tuple, Union
 
+import os
 import torch
 import torch.nn as nn
 
@@ -55,7 +56,63 @@ def _generate_mask_from_stats_mass(tile_stats, seq_q, head_dim, head_dim_v, dtyp
     if seq_q != actual_seq_q: raise RuntimeError(f"Mask generation requires seq_q == tile_stats.shape[2] (seq_q={seq_q}, tile_stats_seq_q={actual_seq_q}).")
     if seq_q % kBlockM_bwd != 0: raise RuntimeError(f"Mask generation requires seq_q divisible by kBlockM_bwd (seq_q={seq_q}, kBlockM_bwd={kBlockM_bwd}).")
 
-    return _mask_from_stats_fused(tile_lse, softmax_lse, num_row_tiles_bwd, kBlockM_bwd, negl_prob).contiguous()
+    mask = _mask_from_stats_fused(tile_lse, softmax_lse, num_row_tiles_bwd, kBlockM_bwd, negl_prob).contiguous()
+
+    if os.environ.get('DEBUG_BACKLITE_SPARSITY'):
+        stats = compute_sparsity(tile_stats, mask, seq_q)
+        print(f"[BackLite] causal_sparsity={stats['causal_sparsity']:.2%}  additional_sparsity={stats['additional_sparsity']:.2%}")
+
+    return mask
+
+
+def compute_sparsity(tile_stats: torch.Tensor, mask: torch.Tensor, seq_q: int) -> dict:
+    """Compute backward sparsity metrics from forward tile statistics and backward block mask.
+
+    Two complementary metrics:
+
+    - ``causal_sparsity``: fraction of causal-triangle tiles skipped in the backward pass.
+      Denominator = all tiles ``(m, n)`` where ``n*kBlockN < (m+1)*kBlockM`` (lower triangle).
+
+    - ``additional_sparsity``: fraction of *actually-planned* tiles skipped, where
+      "planned" means the forward pass touched that tile (``tile_stats > -inf``).
+      For full-attention (L) layers this equals ``causal_sparsity``; for sliding-window
+      (S) layers the window already excludes many causal tiles, so this metric shows only
+      BackLite's extra savings on top of both causal *and* window masking.
+
+    Args:
+        tile_stats: Forward tile LSE tensor, shape ``[B, H, seq_q, N_k]``.  Values are
+            in log2 domain; ``-inf`` for tiles outside causal/window attention.
+        mask: Backward block sparsity mask from :func:`_generate_mask_from_stats_mass`,
+            shape ``[B, H, Tm, N_k]`` (bool or float).  ``True``/1 = tile computed.
+        seq_q: Query sequence length (= ``tile_stats.shape[2]``).
+
+    Returns:
+        ``dict`` with float keys ``'causal_sparsity'`` and ``'additional_sparsity'``.
+    """
+    B, H, Tm, N_k = mask.shape
+    kBlockM = seq_q // Tm   # query rows per backward tile
+    kBlockN = seq_q // N_k  # key cols per block (assumes square, same seq_k)
+
+    # --- causal triangle sparsity ---
+    m_idx = torch.arange(Tm, device=mask.device)
+    n_idx = torch.arange(N_k, device=mask.device)
+    causal_active = (n_idx[None, :] * kBlockN) < ((m_idx[:, None] + 1) * kBlockM)
+    n_causal = causal_active.sum()
+    n_computed = mask.float()[:, :, causal_active].sum()
+    causal_density = n_computed / (n_causal * B * H).float().clamp(min=1)
+
+    # --- additional sparsity (within actually-planned tiles: causal + window) ---
+    # Aggregate kBlockM forward rows into each backward tile row via max pooling.
+    ts_tiled = tile_stats.reshape(B, H, Tm, kBlockM, N_k).amax(dim=3)  # [B, H, Tm, N_k]
+    planned = ts_tiled > -1e37  # True for tiles the forward actually attended to
+    n_planned = planned.sum().float().clamp(min=1)
+    n_bwd = mask.float().sum()
+    additional_density = n_bwd / n_planned
+
+    return {
+        'causal_sparsity': (1.0 - causal_density).clamp(0.0, 1.0).item(),
+        'additional_sparsity': (1.0 - additional_density).clamp(0.0, 1.0).item(),
+    }
 
 
 def _flash_attn_forward(
@@ -233,7 +290,10 @@ def _back_lite_fwd(
         tile_stats: Optional[torch.Tensor] = torch.full(
             (batch, heads, num_n_blocks, seq_q), float('-inf'),
             device=q.device, dtype=torch.float32,
-        ).permute(0, 1, 3, 2).contiguous()  # [B,H,T,N] with stride_m=1
+        ).permute(0, 1, 3, 2)  # [B,H,T,N] with stride_m=1 (non-contiguous is intentional)
+        # NOTE: do NOT call .contiguous() here – permute gives stride_m=1 which the
+        # FA3 forward kernel requires when writing tile_stats.  Calling .contiguous()
+        # would relayout to stride_m=N, causing cudaErrorMisalignedAddress in the kernel.
     else:
         tile_stats = None
 
