@@ -537,6 +537,7 @@ if not SKIP_CUDA_BUILD:
     if not DISABLE_SPLIT:
         sources += ["_internal/cpp/flash_fwd_combine.cu"]
     sources += ["_internal/cpp/flash_prepare_scheduler.cu"]
+    sources += ["_internal/cpp/mask_small.cu"]
     # Add quantization kernels for INT8 support
     # Force include to ensure symbol definition
     sources += ["_internal/cpp/quant.cu"]

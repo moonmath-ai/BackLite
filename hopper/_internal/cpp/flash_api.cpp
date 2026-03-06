@@ -14,11 +14,12 @@
  #include "static_switch.h"
  #include "tile_size.h"
  #include "heuristics.h"
- #include "cuda_check.h"
- #include "quant.h"
- 
- 
- extern "C" {
+#include "cuda_check.h"
+#include "quant.h"
+
+at::Tensor block_mask_small(const at::Tensor& tile_stats, const at::Tensor& softmax_lse, int64_t kBlockM, double negl_prob);
+
+extern "C" {
  /* Creates a dummy empty _C module that can be imported from Python.
      The import from Python will load the .so consisting of this file
      in this extension, so that the TORCH_LIBRARY static initializers
@@ -44,7 +45,7 @@
  
  #define PREPARE_VARLEN_MAX_BATCHES_1CTA 992
 
- namespace {
+namespace {
 int bwd_sorted_remap_min_col_tiles() {
     static int min_col_tiles = []() {
         constexpr int kDefaultMinColTiles = 256;
@@ -57,7 +58,18 @@ int bwd_sorted_remap_min_col_tiles() {
      }();
      return min_col_tiles;
  }
- }  // namespace
+
+bool use_fused_small_mask(int seqlen_q, int seqlen_k, int head_size_rounded, bool is_causal, bool is_local, double softcap, int num_col_tiles) {
+    return is_causal
+        && !is_local
+        && softcap == 0.0
+        && head_size_rounded == 128
+        && seqlen_q <= 2048
+        && seqlen_k <= 2048
+        && num_col_tiles > 0
+        && num_col_tiles <= 32;
+}
+}  // namespace
  
  void set_params_fprop(Flash_fwd_params &params,
                        // sizes
@@ -1415,7 +1427,9 @@ inline std::tuple<int, int> tile_size_bwd(int arch, int head_size_rounded, bool 
      double softcap,
      bool deterministic,
      int64_t sm_margin,
-     std::optional<at::Tensor> block_mask_ = std::nullopt
+     std::optional<at::Tensor> block_mask_ = std::nullopt,
+     std::optional<at::Tensor> tile_stats_ = std::nullopt,
+     double negl_prob = 0.0
  ) {
  
      #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -1498,7 +1512,7 @@ inline std::tuple<int, int> tile_size_bwd(int arch, int head_size_rounded, bool 
      int const head_size_v_rounded = head_size_rounded;
      // Very important that these match the kernel configs
      bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-     auto [kBlockM, kBlockN] = tile_size_bwd(arch, head_size_rounded, is_causal, is_local, softcap > 0.0);
+    auto [kBlockM, kBlockN] = tile_size_bwd(arch, head_size_rounded, is_causal, is_local, softcap > 0.0);
      auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
      int const seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
      int const seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);
@@ -1635,11 +1649,18 @@ inline std::tuple<int, int> tile_size_bwd(int arch, int head_size_rounded, bool 
                       softcap,
                       deterministic,
                       sm_margin);
-     params.total_q = total_q;
-     params.total_k = total_k;
-     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
-     params.dv = head_size_v;
-     params.dv_rounded = head_size_v_rounded;
+    params.total_q = total_q;
+    params.total_k = total_k;
+    params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
+    params.dv = head_size_v;
+    params.dv_rounded = head_size_v_rounded;
+    params.ptr_tile_stats = nullptr;
+    params.stride_tile_batch = 0;
+    params.stride_tile_head = 0;
+    params.stride_tile_m = 0;
+    params.stride_tile_n = 0;
+    params.fuse_small_mask = false;
+    params.sparsity_negl_prob = 0.f;
  
      // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
      // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
@@ -1661,18 +1682,59 @@ inline std::tuple<int, int> tile_size_bwd(int arch, int head_size_rounded, bool 
     TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
     #endif
 
+    if (tile_stats_.has_value()) {
+        auto tile_stats = tile_stats_.value();
+        CHECK_DEVICE(tile_stats);
+        TORCH_CHECK(tile_stats.dtype() == torch::kFloat32, "tile_stats must be float32");
+        TORCH_CHECK(tile_stats.dim() == 4, "tile_stats must have shape [batch, head, seq_q, num_n_blocks]");
+        TORCH_CHECK(tile_stats.size(0) == batch_size, "tile_stats batch mismatch");
+        TORCH_CHECK(tile_stats.size(1) == num_heads, "tile_stats head mismatch");
+        TORCH_CHECK(tile_stats.size(2) == seqlen_q, "tile_stats seq_q mismatch");
+        params.ptr_tile_stats = tile_stats.data_ptr<float>();
+        params.stride_tile_batch = tile_stats.stride(0);
+        params.stride_tile_head = tile_stats.stride(1);
+        params.stride_tile_m = tile_stats.stride(2);
+        params.stride_tile_n = tile_stats.stride(3);
+        params.fuse_small_mask = use_fused_small_mask(
+            seqlen_q,
+            seqlen_k,
+            head_size_rounded,
+            is_causal,
+            is_local,
+            softcap,
+            tile_stats.size(3)
+        ) && !block_mask_.has_value();
+        params.sparsity_negl_prob = static_cast<float>(negl_prob);
+    }
+
     // Block sparsity mask — transpose to column-major [B, H, C, R] for stride-1 kernel access
     at::Tensor block_mask_T;
+    at::Tensor block_mask_fused;
     at::Tensor work_remap_tensor;
-    if (block_mask_.has_value()) {
+    if (params.fuse_small_mask) {
+        params.num_row_tiles = seqlen_q / kBlockM;
+        params.num_col_tiles = tile_stats_.value().size(3);
+        block_mask_fused = torch::empty({batch_size, num_heads, params.num_col_tiles, params.num_row_tiles}, opts.dtype(torch::kUInt8));
+        params.ptr_block_mask = block_mask_fused.data_ptr<uint8_t>();
+        params.work_remap = nullptr;
+    } else if (block_mask_.has_value()) {
         auto block_mask = block_mask_.value();
         CHECK_DEVICE(block_mask);
         TORCH_CHECK(block_mask.dtype() == torch::kUInt8, "block_mask must be uint8");
         TORCH_CHECK(block_mask.dim() == 4, "block_mask must have 4 dimensions [batch, head, num_row_tiles, num_col_tiles]");
-        params.num_row_tiles = block_mask.size(2);
-        params.num_col_tiles = block_mask.size(3);
-        block_mask_T = block_mask.permute({0, 1, 3, 2}).contiguous();
-        params.ptr_block_mask = static_cast<uint8_t const*>(block_mask_T.data_ptr());
+        int expected_row_tiles = params.seqlen_q_rounded / kBlockM;
+        int expected_col_tiles = params.seqlen_k_rounded / kBlockN;
+        if (block_mask.size(2) == expected_col_tiles && block_mask.size(3) == expected_row_tiles) {
+            CHECK_CONTIGUOUS(block_mask);
+            params.num_row_tiles = expected_row_tiles;
+            params.num_col_tiles = expected_col_tiles;
+            params.ptr_block_mask = static_cast<uint8_t*>(block_mask.data_ptr());
+        } else {
+            params.num_row_tiles = block_mask.size(2);
+            params.num_col_tiles = block_mask.size(3);
+            block_mask_T = block_mask.permute({0, 1, 3, 2}).contiguous();
+            params.ptr_block_mask = static_cast<uint8_t*>(block_mask_T.data_ptr());
+        }
 
         if (params.num_col_tiles >= bwd_sorted_remap_min_col_tiles()) {
             // Sorted CTA scheduling: sort columns by active row count within each
@@ -2002,7 +2064,9 @@ quantize_qk(
         "float softcap = 0.0,"
         "bool deterministic = False,"
         "int sm_margin = 0,"
-        "Tensor? block_mask = None) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "Tensor? block_mask = None,"
+        "Tensor? tile_stats = None,"
+        "float negl_prob = 0.0) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
      m.def("fwd_combine("
          "Tensor out_partial,"
          "Tensor lse_partial,"
@@ -2043,12 +2107,17 @@ quantize_qk(
          "bool paged_kv_non_TMA = False,"
          "bool softcap = False,"
          "bool is_int8 = False) -> int[]", &get_tile_size_fwd_sm90);
-    m.def("get_tile_size_bwd("
+     m.def("get_tile_size_bwd("
         "int headdim,"
         "int headdim_v,"
         "bool is_causal,"
         "bool is_local,"
         "bool softcap = False) -> int[]", &get_tile_size_bwd);
+    m.def("block_mask_small("
+        "Tensor tile_stats,"
+        "Tensor softmax_lse,"
+        "int kBlockM,"
+        "float negl_prob) -> Tensor", &block_mask_small);
     m.def("quantize_qk("
         "Tensor Q,"
         "Tensor K,"
@@ -2059,7 +2128,8 @@ quantize_qk(
  
  TORCH_LIBRARY_IMPL(back_lite, CUDA, m) {
      m.impl("fwd", &mha_fwd);
-     m.impl("bwd", &mha_bwd);
-     m.impl("fwd_combine", &mha_combine);
-     m.impl("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata);
- }
+    m.impl("bwd", &mha_bwd);
+    m.impl("fwd_combine", &mha_combine);
+    m.impl("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata);
+    m.impl("block_mask_small", &block_mask_small);
+}

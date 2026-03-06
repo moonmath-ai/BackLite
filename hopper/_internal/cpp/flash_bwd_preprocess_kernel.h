@@ -65,6 +65,7 @@ public:
     using StridedPsum = cute::Stride<_1, int64_t, int64_t>;
     using ShapedQaccum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
     using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
+    using StrideTileStats = cute::Stride<int64_t, int64_t, int64_t, int64_t>;
 
     // Device side arguments
     struct Arguments {
@@ -87,6 +88,12 @@ public:
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        float const* ptr_tile_stats = nullptr;
+        StrideTileStats stride_tile_stats{};
+        uint8_t* ptr_block_mask = nullptr;
+        int num_row_tiles = 0;
+        int num_col_tiles = 0;
+        float negl_prob = 0.0f;
     };
 
     // Kernel entry point API
@@ -110,6 +117,12 @@ public:
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        float const* ptr_tile_stats = nullptr;
+        StrideTileStats stride_tile_stats{};
+        uint8_t* ptr_block_mask = nullptr;
+        int num_row_tiles = 0;
+        int num_col_tiles = 0;
+        float negl_prob = 0.0f;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -135,7 +148,13 @@ public:
             args.num_batch,
             args.dq_semaphore,
             args.cu_seqlens,
-            args.seqused
+            args.seqused,
+            args.ptr_tile_stats,
+            args.stride_tile_stats,
+            args.ptr_block_mask,
+            args.num_row_tiles,
+            args.num_col_tiles,
+            args.negl_prob
         };
     }
 
@@ -226,6 +245,101 @@ public:
         Tensor gLSElog2 = local_tile(cute::domain_offset(make_coord(seqlen_info.offset_padded), mLSElog2), Shape<Int<kBlockM>>{}, make_coord(m_block));
         if (thread_idx < seqlen_rounded - m_block * kBlockM && thread_idx < kBlockM) {
             gLSElog2(thread_idx) = lse == -INFINITY ? 0.f : lse * float(M_LOG2E);
+        }
+
+        if (params.ptr_tile_stats != nullptr && params.ptr_block_mask != nullptr && params.num_col_tiles > 0 && params.num_col_tiles <= 32) {
+            __shared__ float row_lse_log2[64];
+            __shared__ float mass[32];
+            __shared__ float prob[32];
+            __shared__ float sorted[32];
+            __shared__ float total_prob;
+            __shared__ float threshold;
+            __shared__ int ties_to_ignore;
+
+            int const row_limit = min(kBlockM, seqlen_o - m_block * kBlockM);
+            if (thread_idx < row_limit) {
+                row_lse_log2[thread_idx] = gLSE(thread_idx) * float(M_LOG2E);
+            }
+            if (thread_idx < params.num_col_tiles) {
+                float mass_n = 0.f;
+                int64_t stats_base = int64_t(bidb) * get<0>(params.stride_tile_stats)
+                    + int64_t(bidh) * get<1>(params.stride_tile_stats)
+                    + int64_t(thread_idx) * get<3>(params.stride_tile_stats);
+                #pragma unroll
+                for (int row = 0; row < kBlockM; ++row) {
+                    if (row < row_limit) {
+                        int q = m_block * kBlockM + row;
+                        float tile_lse = params.ptr_tile_stats[stats_base + int64_t(q) * get<2>(params.stride_tile_stats)];
+                        mass_n += exp2f(tile_lse - row_lse_log2[row]);
+                    }
+                }
+                mass[thread_idx] = mass_n;
+            }
+            if (thread_idx == 0) {
+                total_prob = 0.f;
+                threshold = -INFINITY;
+                ties_to_ignore = 0;
+                for (int i = 0; i < params.num_col_tiles; ++i) {
+                    total_prob += mass[i];
+                }
+                if (total_prob > 1e-12f) {
+                    for (int i = 0; i < params.num_col_tiles; ++i) {
+                        prob[i] = mass[i] / total_prob;
+                        sorted[i] = prob[i];
+                    }
+                    for (int i = 1; i < params.num_col_tiles; ++i) {
+                        float x = sorted[i];
+                        int j = i - 1;
+                        while (j >= 0 && sorted[j] > x) {
+                            sorted[j + 1] = sorted[j];
+                            --j;
+                        }
+                        sorted[j + 1] = x;
+                    }
+                    float csum = 0.f;
+                    int ignore_count = 0;
+                    for (int i = 0; i < params.num_col_tiles; ++i) {
+                        csum += sorted[i];
+                        if (csum < params.negl_prob) {
+                            ++ignore_count;
+                            threshold = sorted[i];
+                        } else {
+                            break;
+                        }
+                    }
+                    int strict_count = 0;
+                    for (int i = 0; i < params.num_col_tiles; ++i) {
+                        strict_count += prob[i] < threshold;
+                    }
+                    ties_to_ignore = ignore_count - strict_count;
+                } else {
+                    for (int i = 0; i < params.num_col_tiles; ++i) {
+                        prob[i] = 0.f;
+                    }
+                }
+            }
+            __syncthreads();
+            if (thread_idx < params.num_col_tiles) {
+                uint8_t keep = 1;
+                if (total_prob > 1e-12f) {
+                    if (prob[thread_idx] < threshold) {
+                        keep = 0;
+                    } else if (prob[thread_idx] == threshold) {
+                        int tie_rank = 0;
+                        for (int i = 0; i <= thread_idx; ++i) {
+                            tie_rank += prob[i] == threshold;
+                        }
+                        if (tie_rank <= ties_to_ignore) {
+                            keep = 0;
+                        }
+                    }
+                }
+                int num_head = get<2>(params.shape_O);
+                int64_t mask_offset = (int64_t(bidb) * num_head + bidh) * params.num_col_tiles * params.num_row_tiles
+                    + int64_t(thread_idx) * params.num_row_tiles
+                    + m_block;
+                params.ptr_block_mask[mask_offset] = keep;
+            }
         }
 
         if constexpr (Clear_dQaccum) {

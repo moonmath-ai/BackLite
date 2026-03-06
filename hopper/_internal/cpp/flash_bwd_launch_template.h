@@ -66,7 +66,13 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.b,
         params.dq_semaphore,
         params.cu_seqlens_q,
-        params.seqused_q
+        params.seqused_q,
+        params.fuse_small_mask ? static_cast<float const*>(params.ptr_tile_stats) : nullptr,
+        {params.stride_tile_batch, params.stride_tile_head, params.stride_tile_m, params.stride_tile_n},
+        params.fuse_small_mask ? params.ptr_block_mask : nullptr,
+        params.num_row_tiles,
+        params.num_col_tiles,
+        params.sparsity_negl_prob
     };
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);

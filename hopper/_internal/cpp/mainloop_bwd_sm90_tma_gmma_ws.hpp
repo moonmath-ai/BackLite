@@ -439,6 +439,39 @@ struct CollectiveMainloopBwdSm90 {
             + n_block * params.num_row_tiles;
     }
 
+    struct SmallMaskBits {
+        uint32_t lo = 0;
+        uint32_t hi = 0;
+        bool valid = false;
+    };
+
+    CUTLASS_DEVICE static SmallMaskBits
+    load_small_mask_bits(uint8_t const* __restrict__ mask_col, int num_row_tiles) {
+        SmallMaskBits bits;
+        bits.valid = mask_col != nullptr && num_row_tiles <= 64;
+        if (!bits.valid) { return bits; }
+        int lane = threadIdx.x & 31;
+        uint32_t lo = 0;
+        uint32_t hi = 0;
+        if (lane == 0) {
+            int split = min(num_row_tiles, 32);
+            #pragma unroll
+            for (int i = 0; i < 32; ++i) {
+                if (i < split && mask_col[i]) { lo |= uint32_t(1) << i; }
+                if (i + 32 < num_row_tiles && mask_col[i + 32]) { hi |= uint32_t(1) << i; }
+            }
+        }
+        bits.lo = __shfl_sync(0xffffffff, lo, 0);
+        bits.hi = __shfl_sync(0xffffffff, hi, 0);
+        return bits;
+    }
+
+    CUTLASS_DEVICE static bool
+    mask_is_active(SmallMaskBits const& bits, uint8_t const* __restrict__ mask_col, int m) {
+        if (!bits.valid) { return mask_col == nullptr || mask_col[m] != 0; }
+        return m < 32 ? ((bits.lo >> m) & 1u) != 0 : ((bits.hi >> (m - 32)) & 1u) != 0;
+    }
+
     // Advance to the next active m-block by scanning mask bytes from position m.
     // mask_col == nullptr means no mask → every tile is active (return m).
     __device__ static __forceinline__ int
@@ -447,6 +480,16 @@ struct CollectiveMainloopBwdSm90 {
         #pragma unroll 1
         for (int i = m; i < m_end; ++i) {
             if (__ldg(&mask_col[i])) return i;    // read-only texture cache
+        }
+        return m_end;
+    }
+
+    __device__ static __forceinline__ int
+    next_active_m(SmallMaskBits const& bits, uint8_t const* __restrict__ mask_col, int m, int m_end) {
+        if (mask_col == nullptr) return m;
+        #pragma unroll 1
+        for (int i = m; i < m_end; ++i) {
+            if (mask_is_active(bits, mask_col, i)) return i;
         }
         return m_end;
     }
@@ -479,7 +522,8 @@ struct CollectiveMainloopBwdSm90 {
             }
         }
         auto mask_col = get_mask_col(params, bidb, bidh, n_block);
-        int m_block_first = next_active_m(mask_col, m_block_min, m_block_max);
+        auto small_mask = load_small_mask_bits(mask_col, params.num_row_tiles);
+        int m_block_first = next_active_m(small_mask, mask_col, m_block_min, m_block_max);
         if (m_block_first >= m_block_max) {
             scheduler_prefetch();
             return;
@@ -573,7 +617,7 @@ struct CollectiveMainloopBwdSm90 {
                 copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
                      gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
                 if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
-                m_block = next_active_m(mask_col, m_block + 1, m_block_max);
+                m_block = next_active_m(small_mask, mask_col, m_block + 1, m_block_max);
                 ++smem_pipe_write;
                 if (m_block >= m_block_max) { break; }
                 pipeline_q.producer_acquire(smem_pipe_write);
@@ -641,7 +685,8 @@ struct CollectiveMainloopBwdSm90 {
             if (m_block_max <= m_block_min) { return; }
         }
         auto mask_col = get_mask_col(params, bidb, bidh, n_block);
-        int m_block = next_active_m(mask_col, m_block_min, m_block_max);
+        auto small_mask = load_small_mask_bits(mask_col, params.num_row_tiles);
+        int m_block = next_active_m(small_mask, mask_col, m_block_min, m_block_max);
 
         Tensor sdQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_dqacc.data()), SmemLayoutdQaccum{});
         static constexpr int dQ_TMA_num_bytes = CUTE_STATIC_V(size<0>(sdQ)) * sizeof(ElementAccum);
@@ -693,14 +738,14 @@ struct CollectiveMainloopBwdSm90 {
                     if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(warpgroup_idx)>(); }
                     cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);  // sdQ empty, ready to be written to
                 });
-                m_block = next_active_m(mask_col, m_block + 1, m_block_max);
+                m_block = next_active_m(small_mask, mask_col, m_block + 1, m_block_max);
             }
             return;
         }
         // Deterministic: iterate ALL m-blocks for barrier ordering, check mask per tile
         #pragma unroll 2
         for (int m_blk = m_block_min; m_blk < m_block_max; ++m_blk) {
-            bool const is_block_active = mask_col == nullptr || mask_col[m_blk] != 0;
+            bool const is_block_active = mask_is_active(small_mask, mask_col, m_blk);
             if constexpr (Deterministic) {
                 Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_blk * num_batch * num_head, n_block);
             }
@@ -882,7 +927,8 @@ struct CollectiveMainloopBwdSm90 {
 
         // Block sparsity — byte-pointer for next-active-m scanning
         auto mask_col = get_mask_col(params, bidb, bidh, n_block);
-        int m_block = next_active_m(mask_col, m_block_min, m_block_max);
+        auto small_mask = load_small_mask_bits(mask_col, params.num_row_tiles);
+        int m_block = next_active_m(small_mask, mask_col, m_block_min, m_block_max);
         if (m_block >= m_block_max) { return false; }
 
         clear(tdKrdK);
@@ -1080,7 +1126,7 @@ struct CollectiveMainloopBwdSm90 {
             CUTLASS_PRAGMA_NO_UNROLL
             while (m_block < m_block_end) {
                 bwd_step(m_block, mask_fn);
-                m_block = next_active_m(mask_col, m_block + 1, m_block_max);
+                m_block = next_active_m(small_mask, mask_col, m_block + 1, m_block_max);
             }
         }
 
@@ -1094,7 +1140,7 @@ struct CollectiveMainloopBwdSm90 {
         CUTLASS_PRAGMA_NO_UNROLL
         while (m_block < m_block_max_before_local_mask) {
             bwd_step(m_block, mask_fn);
-            m_block = next_active_m(mask_col, m_block + 1, m_block_max);
+            m_block = next_active_m(small_mask, mask_col, m_block + 1, m_block_max);
         }
 
         if constexpr (Is_local && SeparateMaskingIterations) {
@@ -1102,7 +1148,7 @@ struct CollectiveMainloopBwdSm90 {
             CUTLASS_PRAGMA_NO_UNROLL
             while (m_block < m_block_max) {
                 bwd_step(m_block, mask_fn);
-                m_block = next_active_m(mask_col, m_block + 1, m_block_max);
+                m_block = next_active_m(small_mask, mask_col, m_block + 1, m_block_max);
             }
         }
 

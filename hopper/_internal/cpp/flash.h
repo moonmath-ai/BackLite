@@ -231,9 +231,11 @@ struct Flash_bwd_params : public Flash_fwd_params
     index_t dq_accum_split_stride;
     
     // Block sparsity mask (backward pass) — column-transposed [B, H, C, R] uint8
-    uint8_t const* ptr_block_mask;
+    uint8_t* ptr_block_mask;
     int num_row_tiles;
     int num_col_tiles;
+    bool fuse_small_mask = false;
+    float sparsity_negl_prob = 0.f;
 
     // Sorted CTA scheduling remap array for block sparsity
     int32_t const* work_remap = nullptr;
