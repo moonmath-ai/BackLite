@@ -59,19 +59,21 @@ def _generate_mask_from_stats_mass(tile_stats, seq_q, head_dim, head_dim_v, dtyp
     mask = _mask_from_stats_fused(tile_lse, softmax_lse, num_row_tiles_bwd, kBlockM_bwd, negl_prob).contiguous()
 
     if os.environ.get('DEBUG_BACKLITE_SPARSITY'):
-        stats = compute_sparsity(tile_stats, mask, seq_q)
-        print(f"[BackLite] causal_sparsity={stats['causal_sparsity']:.2%}  additional_sparsity={stats['additional_sparsity']:.2%}")
+        stats = compute_sparsity(tile_stats, mask, seq_q, is_causal=is_causal)
+        mode = "causal" if is_causal else ("local" if is_local else "full")
+        print(f"[BackLite] mode={mode}  overall_sparsity={stats['causal_sparsity']:.2%}  additional_sparsity={stats['additional_sparsity']:.2%}")
 
     return mask
 
 
-def compute_sparsity(tile_stats: torch.Tensor, mask: torch.Tensor, seq_q: int) -> dict:
+def compute_sparsity(tile_stats: torch.Tensor, mask: torch.Tensor, seq_q: int, is_causal: bool = True) -> dict:
     """Compute backward sparsity metrics from forward tile statistics and backward block mask.
 
     Two complementary metrics:
 
-    - ``causal_sparsity``: fraction of causal-triangle tiles skipped in the backward pass.
-      Denominator = all tiles ``(m, n)`` where ``n*kBlockN < (m+1)*kBlockM`` (lower triangle).
+    - ``causal_sparsity``: fraction of *relevant* tiles skipped in the backward pass.
+      When ``is_causal=True``: denominator = causal triangle tiles (lower triangle).
+      When ``is_causal=False``: denominator = all tiles (full attention matrix).
 
     - ``additional_sparsity``: fraction of *actually-planned* tiles skipped, where
       "planned" means the forward pass touched that tile (``tile_stats > -inf``).
@@ -85,6 +87,7 @@ def compute_sparsity(tile_stats: torch.Tensor, mask: torch.Tensor, seq_q: int) -
         mask: Backward block sparsity mask from :func:`_generate_mask_from_stats_mass`,
             shape ``[B, H, Tm, N_k]`` (bool or float).  ``True``/1 = tile computed.
         seq_q: Query sequence length (= ``tile_stats.shape[2]``).
+        is_causal: If True, first metric uses causal triangle; if False, uses full matrix.
 
     Returns:
         ``dict`` with float keys ``'causal_sparsity'`` and ``'additional_sparsity'``.
@@ -93,13 +96,17 @@ def compute_sparsity(tile_stats: torch.Tensor, mask: torch.Tensor, seq_q: int) -
     kBlockM = seq_q // Tm   # query rows per backward tile
     kBlockN = seq_q // N_k  # key cols per block (assumes square, same seq_k)
 
-    # --- causal triangle sparsity ---
-    m_idx = torch.arange(Tm, device=mask.device)
-    n_idx = torch.arange(N_k, device=mask.device)
-    causal_active = (n_idx[None, :] * kBlockN) < ((m_idx[:, None] + 1) * kBlockM)
-    n_causal = causal_active.sum()
-    n_computed = mask.float()[:, :, causal_active].sum()
-    causal_density = n_computed / (n_causal * B * H).float().clamp(min=1)
+    # --- region sparsity: causal triangle (causal) or full matrix (noncausal) ---
+    if is_causal:
+        m_idx = torch.arange(Tm, device=mask.device)
+        n_idx = torch.arange(N_k, device=mask.device)
+        causal_active = (n_idx[None, :] * kBlockN) < ((m_idx[:, None] + 1) * kBlockM)
+        n_region = causal_active.sum()
+        n_computed = mask.float()[:, :, causal_active].sum()
+    else:
+        n_region = Tm * N_k
+        n_computed = mask.float().sum()
+    region_density = n_computed / max(float(n_region * B * H), 1.0)
 
     # --- additional sparsity (within actually-planned tiles: causal + window) ---
     # Aggregate kBlockM forward rows into each backward tile row via max pooling.
@@ -110,7 +117,7 @@ def compute_sparsity(tile_stats: torch.Tensor, mask: torch.Tensor, seq_q: int) -
     additional_density = n_bwd / n_planned
 
     return {
-        'causal_sparsity': (1.0 - causal_density).clamp(0.0, 1.0).item(),
+        'causal_sparsity': (1.0 - region_density).clamp(0.0, 1.0).item(),
         'additional_sparsity': (1.0 - additional_density).clamp(0.0, 1.0).item(),
     }
 
