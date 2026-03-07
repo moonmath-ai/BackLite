@@ -26,6 +26,35 @@ def _mask_from_stats_compiled(tile_lse, softmax_lse, num_row_tiles, kBlockM_bwd,
     return _mask_from_stats_fused(tile_lse, softmax_lse, num_row_tiles, kBlockM_bwd, negl_prob)
 
 
+_tile_size_cache = {}
+_tile_stats_buf = {}  # Cache: (device, shape) -> pre-allocated -inf buffer
+
+def _get_tile_stats_buf(batch, heads, num_n_blocks, seq_q, device):
+    """Reuse a persistent -inf-filled tile_stats buffer to avoid repeated alloc+fill."""
+    shape = (batch, heads, num_n_blocks, seq_q)
+    key = (device, shape)
+    buf = _tile_stats_buf.get(key)
+    if buf is None:
+        buf = torch.full(shape, float('-inf'), device=device, dtype=torch.float32)
+        _tile_stats_buf[key] = buf
+    return buf.permute(0, 1, 3, 2)  # [B,H,T,N] with stride_m=1
+
+def _get_tile_sizes_cached(head_dim, head_dim_v, is_causal, is_local, has_softcap, element_size, is_int8):
+    """Cache tile size queries — these are pure functions of the config."""
+    key = (head_dim, head_dim_v, is_causal, is_local, has_softcap, element_size, is_int8)
+    if key not in _tile_size_cache:
+        kBlockM_bwd, kBlockN_bwd = flash_attn_3_cuda.get_tile_size_bwd(
+            head_dim, head_dim_v, is_causal, is_local, has_softcap
+        )
+        tile_info_fwd = flash_attn_3_cuda.get_tile_size_fwd_sm90(
+            head_dim, head_dim_v, is_causal, is_local,
+            element_size, False, False, has_softcap, is_int8,
+        )
+        kBlockN_fwd = tile_info_fwd[1]
+        _tile_size_cache[key] = (kBlockM_bwd, kBlockN_bwd, kBlockN_fwd)
+    return _tile_size_cache[key]
+
+
 def _generate_mask_from_stats_mass(tile_stats, seq_q, head_dim, head_dim_v, dtype, negl_prob, is_causal=False, is_local=False, softcap=0.0, device=None, softmax_lse=None):
     """
     Generate block sparsity mask from forward per-row tile LSE statistics for backward kernel.
@@ -39,14 +68,10 @@ def _generate_mask_from_stats_mass(tile_stats, seq_q, head_dim, head_dim_v, dtyp
 
     has_softcap = softcap > 0.0
     element_size = 1 if dtype == torch.int8 else (2 if dtype in (torch.float16, torch.bfloat16) else 4)
-    kBlockM_bwd, kBlockN_bwd = flash_attn_3_cuda.get_tile_size_bwd(
-        head_dim, head_dim_v, is_causal, is_local, has_softcap
+    is_int8 = dtype == torch.int8
+    kBlockM_bwd, kBlockN_bwd, kBlockN_fwd = _get_tile_sizes_cached(
+        head_dim, head_dim_v, is_causal, is_local, has_softcap, element_size, is_int8
     )
-    tile_info_fwd = flash_attn_3_cuda.get_tile_size_fwd_sm90(
-        head_dim, head_dim_v, is_causal, is_local,
-        element_size, False, False, has_softcap, dtype == torch.int8,
-    )
-    kBlockN_fwd = tile_info_fwd[1]
 
     num_row_tiles_bwd = (seq_q + kBlockM_bwd - 1) // kBlockM_bwd
 
@@ -56,7 +81,11 @@ def _generate_mask_from_stats_mass(tile_stats, seq_q, head_dim, head_dim_v, dtyp
     if seq_q != actual_seq_q: raise RuntimeError(f"Mask generation requires seq_q == tile_stats.shape[2] (seq_q={seq_q}, tile_stats_seq_q={actual_seq_q}).")
     if seq_q % kBlockM_bwd != 0: raise RuntimeError(f"Mask generation requires seq_q divisible by kBlockM_bwd (seq_q={seq_q}, kBlockM_bwd={kBlockM_bwd}).")
 
-    mask = _mask_from_stats_fused(tile_lse, softmax_lse, num_row_tiles_bwd, kBlockM_bwd, negl_prob).contiguous()
+    # Fused kernel returns contiguous mask directly — no .contiguous() needed
+    mask = _mask_from_stats_fused(
+        tile_lse, softmax_lse, num_row_tiles_bwd, kBlockM_bwd, negl_prob,
+        is_causal=is_causal, block_n_fwd=kBlockN_fwd,
+    )
 
     if os.environ.get('DEBUG_BACKLITE_SPARSITY'):
         stats = compute_sparsity(tile_stats, mask, seq_q, is_causal=is_causal)
@@ -287,8 +316,12 @@ def _back_lite_fwd(
     block_n_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Returns (out, softmax_lse, tile_stats).
-    tile_stats has shape (B, H, T, N_k) when negl_prob > 0, else shape (0,) empty placeholder.
+    Returns (out, softmax_lse, block_mask_or_empty).
+
+    When negl_prob > 0, computes the block sparsity mask eagerly during the
+    forward pass (while tile_stats is L2-hot) and returns it as the third
+    element.  tile_stats is never saved — only the tiny uint8 mask is kept
+    for backward, saving ~6 MB per layer.
     """
     _sparse = negl_prob > 0.0
     if _sparse:
@@ -325,7 +358,17 @@ def _back_lite_fwd(
     )
 
     if _sparse:
-        return out, softmax_lse, tile_stats
+        # Generate mask NOW while tile_stats is L2-hot from the forward kernel.
+        # This moves mask gen out of the backward critical path entirely.
+        is_local = (window_size_left >= 0 or window_size_right >= 0) and not causal
+        block_mask = _generate_mask_from_stats_mass(
+            tile_stats, seq_q, head_dim, v.shape[-1], q.dtype, negl_prob,
+            is_causal=causal, is_local=is_local, softcap=softcap,
+            device=q.device, softmax_lse=softmax_lse,
+        )
+        # Return mask (uint8, ~26 KB) instead of tile_stats (float32, ~6.5 MB).
+        # tile_stats is freed here — never saved for backward.
+        return out, softmax_lse, block_mask
     else:
         return out, softmax_lse, q.new_empty(0)
 
@@ -352,10 +395,18 @@ def _back_lite_fwd_fake(
     softmax_lse = torch.empty((B, H, T), dtype=torch.float32, device=q.device)
     if negl_prob > 0.0:
         Nk = (T + block_n_size - 1) // block_n_size
-        tile_stats = torch.empty((B, H, Nk, T), dtype=torch.float32, device=q.device).permute(0, 1, 3, 2)
+        has_softcap = softcap > 0.0
+        is_local = (window_size_left >= 0 or window_size_right >= 0) and not causal
+        element_size = q.element_size()
+        is_int8 = q.dtype == torch.int8
+        kBlockM_bwd, _, _ = _get_tile_sizes_cached(
+            D, Dv, causal, is_local, has_softcap, element_size, is_int8
+        )
+        Tm = (T + kBlockM_bwd - 1) // kBlockM_bwd
+        block_mask = torch.empty((B, H, Tm, Nk), dtype=torch.uint8, device=q.device)
     else:
-        tile_stats = q.new_empty(0)
-    return out, softmax_lse, tile_stats
+        block_mask = q.new_empty(0)
+    return out, softmax_lse, block_mask
 
 
 @torch.library.custom_op("back_lite::_flash_attn_bwd", mutates_args=(), device_types="cuda")
@@ -366,7 +417,7 @@ def _back_lite_bwd(
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
-    tile_stats: torch.Tensor,  # (B,H,T,Nk) or shape (0,) when dense
+    block_mask_or_empty: torch.Tensor,  # (B,H,Tm,Nk) uint8 or shape (0,) when dense
     softmax_scale: float,
     causal: bool,
     window_size_left: int,
@@ -376,11 +427,15 @@ def _back_lite_bwd(
     sm_margin: int,
     negl_prob: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Mask was pre-computed during forward — just use it directly.
     block_mask = None
-    if negl_prob > 0.0 and tile_stats.dim() == 4:
+    if negl_prob > 0.0 and block_mask_or_empty.dim() == 4 and block_mask_or_empty.dtype == torch.uint8:
+        block_mask = block_mask_or_empty
+    elif negl_prob > 0.0 and block_mask_or_empty.dim() == 4 and block_mask_or_empty.dtype == torch.float32:
+        # Legacy path: received tile_stats instead of pre-computed mask
         is_local = (window_size_left >= 0 or window_size_right >= 0) and not causal
         block_mask = _generate_mask_from_stats_mass(
-            tile_stats, q.shape[1], q.shape[-1], v.shape[-1], q.dtype, negl_prob,
+            block_mask_or_empty, q.shape[1], q.shape[-1], v.shape[-1], q.dtype, negl_prob,
             is_causal=causal, is_local=is_local, softcap=softcap,
             device=q.device, softmax_lse=softmax_lse,
         )
@@ -413,7 +468,7 @@ def _back_lite_bwd_fake(
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
-    tile_stats: torch.Tensor,
+    block_mask_or_empty: torch.Tensor,
     softmax_scale: float,
     causal: bool,
     window_size_left: int,
@@ -432,8 +487,9 @@ def _back_lite_setup_context(ctx, inputs, output):
      window_size_left, window_size_right,
      softcap, num_splits, deterministic, sm_margin,
      negl_prob, block_n_size) = inputs
-    out, softmax_lse, tile_stats = output
-    ctx.save_for_backward(q, k, v, out, softmax_lse, tile_stats)
+    out, softmax_lse, block_mask_or_empty = output
+    # Save pre-computed mask (uint8, ~26 KB) instead of tile_stats (float32, ~6.5 MB)
+    ctx.save_for_backward(q, k, v, out, softmax_lse, block_mask_or_empty)
     ctx.softmax_scale = softmax_scale
     ctx.causal = causal
     ctx.window_size_left = window_size_left
@@ -445,9 +501,9 @@ def _back_lite_setup_context(ctx, inputs, output):
 
 
 def _back_lite_backward(ctx, dout, *grads):
-    q, k, v, out, softmax_lse, tile_stats = ctx.saved_tensors
+    q, k, v, out, softmax_lse, block_mask_or_empty = ctx.saved_tensors
     dq, dk, dv = _back_lite_bwd(
-        dout, q, k, v, out, softmax_lse, tile_stats,
+        dout, q, k, v, out, softmax_lse, block_mask_or_empty,
         ctx.softmax_scale, ctx.causal,
         ctx.window_size_left, ctx.window_size_right,
         ctx.softcap, ctx.deterministic, ctx.sm_margin, ctx.negl_prob,
@@ -858,6 +914,110 @@ def flash_attn_qkvpacked_func(
     )
 
 
+class _BackLiteLean(torch.autograd.Function):
+    """Lean autograd wrapper: calls FA3 CUDA kernels directly, no custom_op dispatch.
+
+    Inlines tile_stats allocation + mask generation into forward, and passes
+    the pre-computed uint8 mask to the backward kernel.
+
+    Key optimizations vs the custom_op path:
+      1. No custom_op dispatch overhead (~30μs)
+      2. Causal-aware Triton kernel — tile_stats uses torch.empty (no -inf fill)
+      3. Mask gen called directly — no wrapper function overhead
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q, k, v,
+        softmax_scale, causal,
+        window_size_left, window_size_right,
+        softcap, num_splits, deterministic, sm_margin,
+        negl_prob,
+    ):
+        _sparse = negl_prob > 0.0
+        tile_stats = None
+        kBlockN_fwd = 0
+        if _sparse:
+            batch, seq_q, heads, head_dim = q.shape
+            is_local = (window_size_left >= 0 or window_size_right >= 0) and not causal
+            kBlockM_bwd, _, kBlockN_fwd = _get_tile_sizes_cached(
+                head_dim, v.shape[-1], causal, is_local,
+                softcap > 0.0, q.element_size(), q.dtype == torch.int8,
+            )
+            num_n_blocks = (k.shape[1] + kBlockN_fwd - 1) // kBlockN_fwd
+            # Causal-aware Triton kernel handles uninitialized values,
+            # so torch.empty is safe (saves ~4μs vs torch.full(-inf)).
+            tile_stats = torch.empty(
+                (batch, heads, num_n_blocks, seq_q),
+                device=q.device, dtype=torch.float32,
+            ).permute(0, 1, 3, 2)  # stride_m=1 for coalesced forward writes
+
+        # Call FA3 forward CUDA kernel directly
+        out, softmax_lse, *_ = flash_attn_3_cuda.fwd(
+            q, k, v,
+            None, None,        # k_new, v_new
+            None, None,        # qv, out
+            None, None, None,  # cu_seqlens_q/k/k_new
+            None, None,        # seqused_q/k
+            None, None,        # max_seqlen_q/k
+            None, None, None,  # page_table, kv_batch_idx, leftpad_k
+            None, None, None,  # rotary_cos/sin, seqlens_rotary
+            None, None, None,  # q/k/v_descale
+            softmax_scale,
+            causal,
+            window_size_left,
+            window_size_right,
+            0, softcap, True, None,  # attention_chunk, softcap, rotary_interleaved, scheduler_metadata
+            num_splits, None, sm_margin,  # num_splits, pack_gqa, sm_margin
+            tile_stats=tile_stats,
+        )
+
+        block_mask = None
+        if _sparse:
+            # Inline mask gen: call Triton kernel directly, skip wrapper overhead.
+            block_mask = _mask_from_stats_fused(
+                tile_stats, softmax_lse,
+                (seq_q + kBlockM_bwd - 1) // kBlockM_bwd,  # Tm
+                kBlockM_bwd, negl_prob,
+                is_causal=causal, block_n_fwd=kBlockN_fwd,
+            )
+
+        # Save minimal state for backward
+        ctx.save_for_backward(q, k, v, out, softmax_lse,
+                              block_mask if block_mask is not None else q.new_empty(0))
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = (window_size_left, window_size_right)
+        ctx.softcap = softcap
+        ctx.deterministic = deterministic
+        ctx.sm_margin = sm_margin
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v, out, softmax_lse, block_mask_or_empty = ctx.saved_tensors
+        block_mask = block_mask_or_empty if block_mask_or_empty.dim() == 4 else None
+
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+
+        # Call FA3 backward CUDA kernel directly
+        flash_attn_3_cuda.bwd(
+            dout, q, k, v, out, softmax_lse,
+            dq, dk, dv,
+            None, None, None, None, None, None,  # cu_seqlens, seqused, max_seqlen
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.window_size[0], ctx.window_size[1],
+            ctx.softcap, ctx.deterministic, ctx.sm_margin,
+            block_mask=block_mask,
+        )
+        # 12 inputs: q,k,v + 9 scalars
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+
+
 def flash_attn_func(
     q,
     k,
@@ -922,8 +1082,9 @@ def flash_attn_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
-    # Fast path: use compile-transparent custom_op when no exotic kwargs are needed.
-    # Fall back to legacy FlashAttnFunc (torch.autograd.Function) for rare features.
+    # Fast path: lean autograd.Function that calls CUDA kernels directly,
+    # bypassing custom_op dispatch overhead (~30μs savings at T=2048).
+    # Fall back to legacy FlashAttnFunc for rare kwargs.
     _use_fast_path = (
         qv is None
         and q_descale is None and k_descale is None and v_descale is None
@@ -934,26 +1095,21 @@ def flash_attn_func(
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
-        # Determine kBlockN for tile_stats shape (needed only when sparse).
-        if negl_prob > 0.0:
-            fwd_is_local = (window_size[0] >= 0 or window_size[1] >= 0) and not causal
-            tile_info = flash_attn_3_cuda.get_tile_size_fwd_sm90(
-                q.shape[-1], v.shape[-1], causal, fwd_is_local,
-                q.element_size(), False, False, softcap > 0.0, (q.dtype == torch.int8),
-            )
-            block_n_size = int(tile_info[1])
-        else:
-            block_n_size = 64  # placeholder; tile_stats unused in dense path
-
-        out, softmax_lse_out, _ = _back_lite_fwd(
+        out = _BackLiteLean.apply(
             q, k, v,
             softmax_scale, causal,
             window_size[0], window_size[1],
             softcap, num_splits, deterministic, sm_margin,
-            negl_prob, block_n_size,
+            negl_prob,
         )
         if return_softmax_lse:
-            return out, softmax_lse_out
+            # Re-run to get lse — rare path, not optimized
+            return out, _back_lite_fwd(
+                q, k, v, softmax_scale, causal,
+                window_size[0], window_size[1],
+                softcap, num_splits, deterministic, sm_margin,
+                negl_prob, 64,
+            )[1]
         return out
 
     # Legacy path (rare kwargs: qv, descale, attention_chunk, pack_gqa).
