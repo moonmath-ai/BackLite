@@ -149,6 +149,10 @@ namespace flash
                 alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
                 alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
             } pipelines;
+
+            // todo: force alignment to float2!
+            float backlite_row_sum[2][NumMmaThreads];
+            // float backlite_row_max[(NumMmaThreads / 4) * 2]; // only the quad leader writes, and we have 2 rows
         };
 
         static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -237,7 +241,7 @@ namespace flash
             // DOR: intresting, using __shfl_sync to distribute the same value in the warp instead of each thread calculating it himself
             // helps the compiler to recognize this is a warp uniform value!
             int const lane_predicate = cute::elect_one_sync();
-            int const warp_idx = cutlass::canonical_warp_idx_sync();
+            int const warp_idx = cutlass:row_sum_ar_ar_idx_sync();
 
             // Issue Tma Descriptor Prefetch from a single thread
             if (warp_idx == 0 && lane_predicate)
@@ -395,64 +399,122 @@ namespace flash
                 int work_idx = 0;
                 int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
                 static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
-                if constexpr (SingleProducerWarp)
-                {
-                    if (warp_idx_in_warpgroup != 0)
+                // TODO: uncomment this back but also check that we don't use backlite!
+                // if constexpr (SingleProducerWarp)
+                // {
+                //     if (warp_idx_in_warpgroup != 0)
+                //     {
+                //         return;
+                //     }
+                // }
+
+                // // DOR: why we exclude warp0 here? shoudn't it also init the consumer?
+                // if (!SingleProducerWarp && warp_idx_in_warpgroup != 0)
+                // {
+                //     scheduler.init_consumer();
+                // }
+
+                // cutlass::arch::wait_on_dependent_grids();
+
+                // bool should_load_KV=false;
+                // // Load Q, K, V
+                // for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0
+                //                             ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler)
+                //                             : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
+                //     work_tile_info.is_valid(params.scheduler);
+                //     work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0
+                //                         ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)
+                //                         : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info))
+                // {
+
+                //     // Get next logical threadblock coordinates.
+                //     auto block_coord = work_tile_info.get_block_coord(params.scheduler);
+                //     SeqlenInfo_t seqlen_info{
+                //         get<2>(block_coord) /*bidb*/,
+                //         get<0>(params.mainloop.shape_Q),
+                //         !params.mainloop.ptr_pagetable ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
+                //         get<0>(params.mainloop.shape_K_new),
+                //         params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
+                //         params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
+                //         params.mainloop.seqlens_rotary};
+                //     if constexpr (AppendKV)
+                //     {
+                //         bool tile_new_valid = mainloop.load_kv_new(
+                //             params.mainloop, pipeline_k_new, pipeline_v_new,
+                //             smem_pipe_write_new, shared_storage, seqlen_info, block_coord, work_idx);
+                //         if (tile_new_valid)
+                //         {
+                //             // if (threadIdx.x == 0) { printf("Producer: Before sync\n"); }
+                //             cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::AppendKV) /*id*/);
+                //             // if (threadIdx.x == 0) { printf("Producer: After sync\n"); }
+                //         }
+                //     }
+                //     auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]()
+                //     {
+                //         scheduler.prefetch_next_work(params.scheduler, work_tile_info);
+                //     };
+
+                //     should_load_KV = mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
+                //                 shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
+
+                // }
+                // mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx, should_load_KV);
+
+                if (warp_idx_in_warpgroup == 0){
+                    // DOR: why we exclude warp0 here? shoudn't it also init the consumer?
+                    if (!SingleProducerWarp && warp_idx_in_warpgroup != 0)
                     {
-                        return;
+                        scheduler.init_consumer();
                     }
-                }
-                // DOR: why we exclude warp0 here? shoudn't it also init the consumer?
-                if (!SingleProducerWarp && warp_idx_in_warpgroup != 0)
-                {
-                    scheduler.init_consumer();
-                }
 
-                cutlass::arch::wait_on_dependent_grids();
+                    cutlass::arch::wait_on_dependent_grids();
 
-                bool should_load_KV=false;
-                // Load Q, K, V
-                for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0
-                                               ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler)
-                                               : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
-                     work_tile_info.is_valid(params.scheduler);
-                     work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0
-                                          ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)
-                                          : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info))
-                {
-
-                    // Get next logical threadblock coordinates.
-                    auto block_coord = work_tile_info.get_block_coord(params.scheduler);
-                    SeqlenInfo_t seqlen_info{
-                        get<2>(block_coord) /*bidb*/,
-                        get<0>(params.mainloop.shape_Q),
-                        !params.mainloop.ptr_pagetable ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
-                        get<0>(params.mainloop.shape_K_new),
-                        params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
-                        params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
-                        params.mainloop.seqlens_rotary};
-                    if constexpr (AppendKV)
+                    bool should_load_KV=false;
+                    // Load Q, K, V
+                    for (auto work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0
+                                                ? scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler)
+                                                : scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
+                        work_tile_info.is_valid(params.scheduler);
+                        work_tile_info = SingleProducerWarp || warp_idx_in_warpgroup == 0
+                                            ? scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)
+                                            : scheduler.template get_next_work</*IsProducerWarp=*/false>(params.scheduler, work_tile_info))
                     {
-                        bool tile_new_valid = mainloop.load_kv_new(
-                            params.mainloop, pipeline_k_new, pipeline_v_new,
-                            smem_pipe_write_new, shared_storage, seqlen_info, block_coord, work_idx);
-                        if (tile_new_valid)
+
+                        // Get next logical threadblock coordinates.
+                        auto block_coord = work_tile_info.get_block_coord(params.scheduler);
+                        SeqlenInfo_t seqlen_info{
+                            get<2>(block_coord) /*bidb*/,
+                            get<0>(params.mainloop.shape_Q),
+                            !params.mainloop.ptr_pagetable ? size<0>(params.mainloop.shape_K) : size<0>(params.mainloop.shape_K) * size<1>(params.mainloop.shape_pagetable),
+                            get<0>(params.mainloop.shape_K_new),
+                            params.mainloop.cu_seqlens_q, params.mainloop.cu_seqlens_k, params.mainloop.cu_seqlens_k_new,
+                            params.mainloop.seqused_q, params.mainloop.seqused_k, params.mainloop.leftpad_k,
+                            params.mainloop.seqlens_rotary};
+                        if constexpr (AppendKV)
                         {
-                            // if (threadIdx.x == 0) { printf("Producer: Before sync\n"); }
-                            cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::AppendKV) /*id*/);
-                            // if (threadIdx.x == 0) { printf("Producer: After sync\n"); }
+                            bool tile_new_valid = mainloop.load_kv_new(
+                                params.mainloop, pipeline_k_new, pipeline_v_new,
+                                smem_pipe_write_new, shared_storage, seqlen_info, block_coord, work_idx);
+                            if (tile_new_valid)
+                            {
+                                // if (threadIdx.x == 0) { printf("Producer: Before sync\n"); }
+                                cutlass::arch::NamedBarrier::sync(NumMmaThreads + NumProducerThreads, static_cast<uint32_t>(FwdNamedBarriers::AppendKV) /*id*/);
+                                // if (threadIdx.x == 0) { printf("Producer: After sync\n"); }
+                            }
                         }
+                        auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]()
+                        {
+                            scheduler.prefetch_next_work(params.scheduler, work_tile_info);
+                        };
+
+                        should_load_KV = mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
+                                    shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
+
                     }
-                    auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]()
-                    {
-                        scheduler.prefetch_next_work(params.scheduler, work_tile_info);
-                    };
-
-                    should_load_KV = mainloop.load(params.mainloop, pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write,
-                                shared_storage, scheduler_prefetch, seqlen_info, block_coord, work_idx);
-
+                    mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx, should_load_KV);
+                }else if (warp_idx_in_warpgroup != 3){
+                    mainloop.backlite_producer(shared_storage, pipeline_v, smem_pipe_write);
                 }
-                mainloop.load_tail(pipeline_k, pipeline_v, pipeline_vt, smem_pipe_write, shared_storage, work_idx, should_load_KV);
             }
             else
             { // Consumer

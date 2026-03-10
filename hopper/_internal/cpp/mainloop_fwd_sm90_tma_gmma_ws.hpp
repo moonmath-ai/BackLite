@@ -1134,6 +1134,21 @@ namespace flash
         }
 
         CUTLASS_DEVICE void
+        backlite_producer(SharedStorage &shared_storage, MainloopPipelineV pipeline_v, PipelineState &smem_pipe_write)
+        {
+            // waits for pipeline_v.consumer_release(smem_pipe_read_v) in the consumer to run
+            // loads our float4 element
+            float4* backlite_stats_ptr = reinterpret_cast<float4*>(shared_storage.backlite_stats);
+            float4 elements = backlite_stats_ptr[threadIdx.x - 32];
+            // sum reduction on the float4 element
+            float sum_val = elements.x + elements.y + elements.z + elements.w;
+            float log_val = __log2f(sum_val);
+            float max_val = shared_storage.backlite_maxs[threadIdx.x - 32];
+            float val = max_val * stats_scale_log2 + log_val;
+
+        }
+
+        CUTLASS_DEVICE void
         warp_scheduler_barrier_sync()
         {
             if constexpr (UseSchedulerBarrier)
@@ -1512,19 +1527,56 @@ namespace flash
                     softmax.template online_softmax_dequantize</*Is_first=*/true, /*Check_inf=*/true>(tSrS_ambiguous_type, tSrS);
                 }
                 if constexpr (SaveTileStats) {
-                    auto row_sum_ar = make_fragment_like(softmax.row_sum);
-                    cute::copy(softmax.row_sum, row_sum_ar);
-                    unsigned lane_ = thread_idx % 32;
-                    unsigned quad_mask_ = 0xFu << (lane_ & ~3u);
-                    float d0_ = row_sum_ar(0), d1_ = row_sum_ar(1);
-                    d0_ += __shfl_xor_sync(quad_mask_, d0_, 2);
-                    d1_ += __shfl_xor_sync(quad_mask_, d1_, 2);
-                    d0_ += __shfl_xor_sync(quad_mask_, d0_, 1);
-                    d1_ += __shfl_xor_sync(quad_mask_, d1_, 1);
-                    row_sum_ar(0) = d0_;
-                    row_sum_ar(1) = d1_;
-                    save_tile_stats_epilogue(stats_row_base, stats_stride_N, softmax.row_max, row_sum_ar,
-                        stats_scale_log2, n_block, thread_idx);
+                    shared_storage.backlite_stats[0][thread_idx] = softmax.row_sum(0);
+                    shared_storage.backlite_stats[1][thread_idx] = softmax.row_sum(1);
+
+                    // // TODO: make the indexing clearning and faster!
+                    // int warp_id = thread_idx / 32;
+                    // int lane_id = thread_idx % 32;
+                    // int address = warp_id * 64;
+                    // shared_storage.backlite_stats[address + lane_id] = softmax.row_sum(0);
+                    // shared_storage.backlite_stats[address + lane_id + 32] = softmax.row_sum(1);
+
+                    // /*
+                    // the threads for which lane_id % 2 == 0 process row 0.
+                    // and the threads for which lane_id % 2 == 1 process row 1.
+                    // */
+                    // // consider: reading float3 (stll writing float4, this way we can do vectorized float2 and regualr float load)
+                    // float4* backlite_stats_ptr = reinterpret_cast<float4*>(shared_storage.backlite_stats);
+                    // float4 elements = backlite_stats_ptr[warp_id * 16 + (lane_id / 4) + (lane_id % 2) * 8];
+                    // float sum_val = elements.x + elements.y + elements.z + elements.w;
+                    // float log_val = __log2f(sum_val);
+                    // float max_val = lane_id % 2 == 0 ? softmax.row_max(0) : softmax.row_max(1);
+                    // float val = max_val * stats_scale_log2 + log_val;
+
+
+                    // const scale_stuff = stats_scale_log2 * 0.25f;
+                    // float const val0 = softmax.row_max(0) * scale_stuff + __log2f(softmax.row_sum(0));
+                    // shared_storage.backlite_stats[0][thread_idx] = val0;
+                    // float const val1 = softmax.row_max(1) * scale_stuff + __log2f(softmax.row_sum(1));
+                    // shared_storage.backlite_stats[1][thread_idx] = val1;
+
+                    // if (thread_idx % 4 == 0) {
+                    //     // todo: make sure this uses vectorized store under the hood!
+                    //     shared_storage.backlite_row_max[(thread_idx / 4) * 2] = softmax.row_max(0);
+                    //     shared_storage.backlite_row_max[(thread_idx / 4) * 2 + 1] = softmax.row_max(1);
+                    // }
+
+                    // auto row_sum_ar = make_fragment_like(softmax.row_sum);
+                    // cute::copy(softmax.row_sum, row_sum_ar);
+                    // unsigned lane_ = thread_idx % 32;
+                    // unsigned quad_mask_ = 0xFu << (lane_ & ~3u);
+                    // float d0_ = row_sum_ar(0), d1_ = row_sum_ar(1);
+                    // d0_ += __shfl_xor_sync(quad_mask_, d0_, 2);
+                    // d1_ += __shfl_xor_sync(quad_mask_, d1_, 2);
+                    // d0_ += __shfl_xor_sync(quad_mask_, d0_, 1);
+                    // d1_ += __shfl_xor_sync(quad_mask_, d1_, 1);
+                    // row_sum_ar(0) = d0_;
+                    // row_sum_ar(1) = d1_;
+                    // save_tile_stats_epilogue(stats_row_base, stats_stride_N, softmax.row_max, row_sum_ar,
+                    //     stats_scale_log2, n_block, thread_idx);
+                    // save_tile_stats_epilogue(stats_row_base, stats_stride_N, softmax.row_max, row_sum_ar,
+                    //     stats_scale_log2, n_block, thread_idx);
                 }
                 if constexpr (Is_FP8 && !V_colmajor)
                 {
@@ -1621,23 +1673,61 @@ namespace flash
                         pipeline_v.consumer_release(smem_pipe_read_v); // release V
                     }
                     if constexpr (SaveTileStats) {
+
                         auto row_sum_ar = make_fragment_like(softmax.row_sum);
                         cute::copy(softmax.row_sum, row_sum_ar);
                         #pragma unroll
                         for (int i = 0; i < size(row_sum_ar); ++i) {
                             row_sum_ar(i) -= row_sum_prev(i);
                         }
-                        unsigned lane_ = thread_idx % 32;
-                        unsigned quad_mask_ = 0xFu << (lane_ & ~3u);
-                        float d0_ = row_sum_ar(0), d1_ = row_sum_ar(1);
-                        d0_ += __shfl_xor_sync(quad_mask_, d0_, 2);
-                        d1_ += __shfl_xor_sync(quad_mask_, d1_, 2);
-                        d0_ += __shfl_xor_sync(quad_mask_, d0_, 1);
-                        d1_ += __shfl_xor_sync(quad_mask_, d1_, 1);
-                        row_sum_ar(0) = d0_;
-                        row_sum_ar(1) = d1_;
-                        save_tile_stats_epilogue(stats_row_base, stats_stride_N, softmax.row_max, row_sum_ar,
-                            stats_scale_log2, new_n_block, thread_idx);
+
+                        shared_storage.backlite_stats[0][thread_idx] = row_sum_ar(0);
+                        shared_storage.backlite_stats[1][thread_idx] = row_sum_ar(1);
+                        // // also save the row max we need
+                        // shared_storage.backlite_stats[2][thread_idx] = thread_idx % 2 == 0 ? softmax.row_max(0) : softmax.row_max(1);
+
+                        // // TODO: make the indexing clearning and faster!
+                        // int warp_id = thread_idx / 32;
+                        // int lane_id = thread_idx % 32;
+                        // int address = warp_id * 64;
+                        // shared_storage.backlite_stats[address + lane_id] = row_sum_ar(0);
+                        // shared_storage.backlite_stats[address + lane_id + 32] = row_sum_ar(1);
+
+                        // /*
+                        // the threads for which lane_id % 2 == 0 process row 0.
+                        // and the threads for which lane_id % 2 == 1 process row 1.
+                        // */
+                        // // consider: reading float3 (stll writing float4, this way we can do vectorized float2 and regualr float load)
+                        // float4* backlite_stats_ptr = reinterpret_cast<float4*>(shared_storage.backlite_stats);
+                        // float4 elements = backlite_stats_ptr[warp_id * 16 + (lane_id / 4) + (lane_id % 2) * 8];
+                        // float sum_val = elements.x + elements.y + elements.z + elements.w;
+                        // float log_val = __log2f(sum_val);
+                        // float max_val = lane_id % 2 == 0 ? softmax.row_max(0) : softmax.row_max(1);
+                        // float val = max_val * stats_scale_log2 + log_val;
+
+                        // auto row_sum_ar = make_fragment_like(softmax.row_sum);
+                        // cute::copy(softmax.row_sum, row_sum_ar);
+                        // #pragma unroll
+                        // for (int i = 0; i < size(row_sum_ar); ++i) {
+                        //     row_sum_ar(i) -= row_sum_prev(i);
+                        // }
+                        // unsigned lane_ = thread_idx % 32;
+                        // unsigned quad_mask_ = 0xFu << (lane_ & ~3u);
+                        // float d0_ = row_sum_ar(0), d1_ = row_sum_ar(1);
+                        // d0_ += __shfl_xor_sync(quad_mask_, d0_, 2);
+                        // d1_ += __shfl_xor_sync(quad_mask_, d1_, 2);
+                        // d0_ += __shfl_xor_sync(quad_mask_, d0_, 1);
+                        // d1_ += __shfl_xor_sync(quad_mask_, d1_, 1);
+                        // row_sum_ar(0) = d0_;
+                        // row_sum_ar(1) = d1_;
+                        // save_tile_stats_epilogue(stats_row_base, stats_stride_N, softmax.row_max, row_sum_ar,
+                        //     stats_scale_log2, new_n_block, thread_idx);
+
+                        // const scale_stuff = stats_scale_log2;
+                        // float const val0 = softmax.row_max(0) * scale_stuff + __log2f(row_sum_ar(0));
+                        // shared_storage.backlite_stats[0][thread_idx] = val0;
+                        // float const val1 = softmax.row_max(1) * scale_stuff + __log2f(row_sum_ar(1));
+                        // shared_storage.backlite_stats[1][thread_idx] = val1;
                     }
                     if constexpr (Is_FP8 && !V_colmajor)
                     {
