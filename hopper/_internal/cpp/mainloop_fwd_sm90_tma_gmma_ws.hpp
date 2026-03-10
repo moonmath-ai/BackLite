@@ -1511,16 +1511,20 @@ namespace flash
                 } else {
                     softmax.template online_softmax_dequantize</*Is_first=*/true, /*Check_inf=*/true>(tSrS_ambiguous_type, tSrS);
                 }
-                // Deferred tile-stats state: allreduce+log2f+store during NEXT iteration's QK overlap
-                float def_d0 = 0.f, def_d1 = 0.f, def_max0 = 0.f, def_max1 = 0.f;
-                int def_tile_n = 0;
                 if constexpr (SaveTileStats) {
-                    // Defer first iteration: row_sum IS the delta (no prior contribution)
-                    def_d0 = softmax.row_sum(0);
-                    def_d1 = softmax.row_sum(1);
-                    def_max0 = softmax.row_max(0);
-                    def_max1 = softmax.row_max(1);
-                    def_tile_n = n_block;
+                    auto row_sum_ar = make_fragment_like(softmax.row_sum);
+                    cute::copy(softmax.row_sum, row_sum_ar);
+                    unsigned lane_ = thread_idx % 32;
+                    unsigned quad_mask_ = 0xFu << (lane_ & ~3u);
+                    float d0_ = row_sum_ar(0), d1_ = row_sum_ar(1);
+                    d0_ += __shfl_xor_sync(quad_mask_, d0_, 2);
+                    d1_ += __shfl_xor_sync(quad_mask_, d1_, 2);
+                    d0_ += __shfl_xor_sync(quad_mask_, d0_, 1);
+                    d1_ += __shfl_xor_sync(quad_mask_, d1_, 1);
+                    row_sum_ar(0) = d0_;
+                    row_sum_ar(1) = d1_;
+                    save_tile_stats_epilogue(stats_row_base, stats_stride_N, softmax.row_max, row_sum_ar,
+                        stats_scale_log2, n_block, thread_idx);
                 }
                 if constexpr (Is_FP8 && !V_colmajor)
                 {
@@ -1577,22 +1581,6 @@ namespace flash
                     flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
                     warp_scheduler_barrier_arrive();
 
-                    // Flush deferred tile_stats from PREVIOUS iteration during QK/PV overlap
-                    if constexpr (SaveTileStats) {
-                        unsigned lane_d = thread_idx % 32;
-                        unsigned qmask_d = 0xFu << (lane_d & ~3u);
-                        def_d0 += __shfl_xor_sync(qmask_d, def_d0, 2);
-                        def_d1 += __shfl_xor_sync(qmask_d, def_d1, 2);
-                        def_d0 += __shfl_xor_sync(qmask_d, def_d0, 1);
-                        def_d1 += __shfl_xor_sync(qmask_d, def_d1, 1);
-                        auto def_mx = make_fragment_like(softmax.row_max);
-                        def_mx(0) = def_max0; def_mx(1) = def_max1;
-                        auto def_sm = make_fragment_like(softmax.row_sum);
-                        def_sm(0) = def_d0; def_sm(1) = def_d1;
-                        save_tile_stats_epilogue(stats_row_base, stats_stride_N, def_mx, def_sm,
-                            stats_scale_log2, def_tile_n, thread_idx);
-                    }
-
                     if constexpr (Is_INT8){
                         softmax.set_dequan_s(KDescaleSliced(new_n_block));
                     }
@@ -1632,13 +1620,24 @@ namespace flash
                         warpgroup_wait<0>();
                         pipeline_v.consumer_release(smem_pipe_read_v); // release V
                     }
-                    // Defer current iteration's tile_stats to next iteration's QK overlap
                     if constexpr (SaveTileStats) {
-                        def_d0 = softmax.row_sum(0) - row_sum_prev(0);
-                        def_d1 = softmax.row_sum(1) - row_sum_prev(1);
-                        def_max0 = softmax.row_max(0);
-                        def_max1 = softmax.row_max(1);
-                        def_tile_n = new_n_block;
+                        auto row_sum_ar = make_fragment_like(softmax.row_sum);
+                        cute::copy(softmax.row_sum, row_sum_ar);
+                        #pragma unroll
+                        for (int i = 0; i < size(row_sum_ar); ++i) {
+                            row_sum_ar(i) -= row_sum_prev(i);
+                        }
+                        unsigned lane_ = thread_idx % 32;
+                        unsigned quad_mask_ = 0xFu << (lane_ & ~3u);
+                        float d0_ = row_sum_ar(0), d1_ = row_sum_ar(1);
+                        d0_ += __shfl_xor_sync(quad_mask_, d0_, 2);
+                        d1_ += __shfl_xor_sync(quad_mask_, d1_, 2);
+                        d0_ += __shfl_xor_sync(quad_mask_, d0_, 1);
+                        d1_ += __shfl_xor_sync(quad_mask_, d1_, 1);
+                        row_sum_ar(0) = d0_;
+                        row_sum_ar(1) = d1_;
+                        save_tile_stats_epilogue(stats_row_base, stats_stride_N, softmax.row_max, row_sum_ar,
+                            stats_scale_log2, new_n_block, thread_idx);
                     }
                     if constexpr (Is_FP8 && !V_colmajor)
                     {
@@ -1712,21 +1711,6 @@ namespace flash
                     consumer_wait(pipeline_v, smem_pipe_read);
                 }
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
-                // Flush last iteration's deferred tile_stats during final PV overlap
-                if constexpr (SaveTileStats) {
-                    unsigned lane_d = thread_idx % 32;
-                    unsigned qmask_d = 0xFu << (lane_d & ~3u);
-                    def_d0 += __shfl_xor_sync(qmask_d, def_d0, 2);
-                    def_d1 += __shfl_xor_sync(qmask_d, def_d1, 2);
-                    def_d0 += __shfl_xor_sync(qmask_d, def_d0, 1);
-                    def_d1 += __shfl_xor_sync(qmask_d, def_d1, 1);
-                    auto def_mx = make_fragment_like(softmax.row_max);
-                    def_mx(0) = def_max0; def_mx(1) = def_max1;
-                    auto def_sm = make_fragment_like(softmax.row_sum);
-                    def_sm(0) = def_d0; def_sm(1) = def_d1;
-                    save_tile_stats_epilogue(stats_row_base, stats_stride_N, def_mx, def_sm,
-                        stats_scale_log2, def_tile_n, thread_idx);
-                }
                 // For INT8, V is bf16, so no v_descale needed (use Is_FP8)
                 float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
                 cute::copy(softmax.finalize(v_descale), scores_scale);
