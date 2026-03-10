@@ -1610,6 +1610,13 @@ namespace flash
                         scoremod_premask_fn(tSrS_ambiguous_type);
                     }
                     mask_fn(tSrS_ambiguous_type, new_n_block);
+
+                    if constexpr (!HasQv)
+                    {
+                        warpgroup_wait<0>();
+                        pipeline_v.consumer_release(smem_pipe_read_v); // release V
+                    }
+
                     cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS_ambiguous_type), scores_scale);
 
                     if constexpr (LargeHeadDimV)
@@ -1627,11 +1634,11 @@ namespace flash
                     } else {
                         softmax.template online_softmax_dequantize</*Is_first=*/false, Check_inf>(tSrS_ambiguous_type, tSrS);
                     }
-                    if constexpr (!HasQv)
-                    {
-                        warpgroup_wait<0>();
-                        pipeline_v.consumer_release(smem_pipe_read_v); // release V
-                    }
+                    // if constexpr (!HasQv)
+                    // {
+                    //     warpgroup_wait<0>();
+                    //     pipeline_v.consumer_release(smem_pipe_read_v); // release V
+                    // }
                     // Defer current iteration's tile_stats to next iteration's QK overlap
                     if constexpr (SaveTileStats) {
                         def_d0 = softmax.row_sum(0) - row_sum_prev(0);
