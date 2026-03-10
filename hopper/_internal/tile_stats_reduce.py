@@ -172,6 +172,104 @@ def _threshold_mask_kernel(
     tl.store(mask_out_ptr + out_offset, mask, mask=valid_n)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Kernel 3: Fused single-kernel path (for N_PAD ≤ 512)
+#
+# Combines both kernels: reduce BLOCK_M rows → tile_mass[N_PAD], then
+# immediately normalize + sort + cumsum + threshold → uint8 mask[N_ACTUAL].
+# No scratch buffer needed — everything stays in registers.
+# ══════════════════════════════════════════════════════════════════════════
+@triton.jit
+def _fused_mask_kernel(
+    tile_lse_ptr,       # [B, H, seq_q, N] float32, stride_row=1, PER-BLOCK LSE
+    softmax_lse_ptr,    # [B, H, seq_q] float32
+    mask_out_ptr,       # [BH, Tm, N_ACTUAL] uint8 — output mask
+    H: tl.constexpr,
+    seq_q,
+    stride_lse_b,
+    stride_lse_h,
+    stride_lse_row,
+    stride_lse_n,
+    stride_slse_b,
+    stride_slse_h,
+    stride_slse_row,
+    negl_prob,
+    N_ACTUAL,
+    N_PAD: tl.constexpr,   # power-of-2 ≥ N_ACTUAL, ≤ 512
+    BLOCK_M: tl.constexpr,
+    Tm: tl.constexpr,
+):
+    """Grid = (B*H, Tm).  Fused reduce + threshold in a single kernel, no scratch."""
+    pid_bh   = tl.program_id(0)
+    pid_tile = tl.program_id(1)
+
+    b = pid_bh // H
+    h = pid_bh % H
+
+    row_offs  = tl.arange(0, BLOCK_M)   # [BLOCK_M]
+    row_start = pid_tile * BLOCK_M
+    rows      = row_start + row_offs
+    valid_rows = rows < seq_q
+
+    lse_base  = b * stride_lse_b  + h * stride_lse_h
+    slse_base = b * stride_slse_b + h * stride_slse_h
+
+    LOG2E_C: tl.constexpr = 1.4426950408889634
+
+    # Pre-load softmax_lse for all rows in this tile [BLOCK_M]
+    safe_rows = tl.minimum(rows, seq_q - 1)
+    slse_log2 = tl.load(
+        softmax_lse_ptr + slse_base + safe_rows * stride_slse_row
+    ) * LOG2E_C
+
+    # ── Load full [BLOCK_M, N_PAD] tile_lse block ──────────────────────
+    n_offs = tl.arange(0, N_PAD)           # [N_PAD]
+    valid_n = n_offs < N_ACTUAL
+
+    ptrs = (tile_lse_ptr + lse_base
+            + rows[:, None]  * stride_lse_row
+            + n_offs[None, :] * stride_lse_n)
+    lse = tl.load(ptrs,
+                  mask=valid_rows[:, None] & valid_n[None, :],
+                  other=float('-inf'))
+
+    # ── Reduce [BLOCK_M, N_PAD] → [N_PAD] tile_mass ────────────────────
+    row_mass = tl.exp2(lse - slse_log2[:, None])
+    row_mass = tl.where(valid_rows[:, None], row_mass, 0.0)
+    tile_mass = tl.sum(row_mass, axis=0)   # [N_PAD]
+
+    # ── Normalize + sort + cumsum + threshold → mask ────────────────────
+    total     = tl.sum(tile_mass)
+    tile_prob = tile_mass / tl.maximum(total, 1e-20)
+    tile_prob = tl.where(valid_n, tile_prob, 0.0)
+
+    sorted_prob = tl.sort(tile_prob)
+    csum        = tl.cumsum(sorted_prob, axis=0)
+
+    budget_mask      = csum < negl_prob
+    n_to_ignore      = tl.sum(budget_mask.to(tl.int32))
+    threshold        = tl.max(tl.where(budget_mask, sorted_prob, float('-inf')))
+
+    n_strictly_below = tl.sum((tile_prob < threshold).to(tl.int32))
+    n_ties_to_ignore = n_to_ignore - n_strictly_below
+    at_threshold     = (tile_prob == threshold)
+    tie_cumcount     = tl.cumsum(at_threshold.to(tl.int32), axis=0)
+    ignore_tie       = at_threshold & (tie_cumcount <= n_ties_to_ignore)
+
+    ignore = (tile_prob < threshold) | ignore_tie
+    mask   = tl.where(ignore, 0, 1).to(tl.uint8)
+    mask   = tl.where(total > 1e-12, mask, 1).to(tl.uint8)
+
+    # ── Write output ─────────────────────────────────────────────────────
+    out_offset = pid_bh * Tm * N_ACTUAL + pid_tile * N_ACTUAL + n_offs
+    tl.store(mask_out_ptr + out_offset, mask, mask=valid_n)
+
+
+# Threshold below which the fused single-kernel path is used.
+# For N_PAD ≤ _FUSED_N_PAD_THRESHOLD we skip the scratch buffer entirely.
+_FUSED_N_PAD_THRESHOLD = 512
+
+
 def mask_from_stats_fused(
     tile_lse: torch.Tensor,      # [B, H, seq_q, N] float32 — per-row cumulative LSE (log2 domain)
     softmax_lse: torch.Tensor,   # [B, H, seq_q] float32 — full-row LSE (ln domain)
@@ -182,9 +280,9 @@ def mask_from_stats_fused(
     """
     Fused mask generation: per-block LSE → uint8 block mask.
 
-    Two-kernel pipeline that avoids expensive transpose copies:
-    1. Reduce kernel: n-major loop, coalesced row loads, exp2 → reduce
-    2. Threshold kernel: sort + cumsum + threshold → mask
+    When N_PAD ≤ _FUSED_N_PAD_THRESHOLD (512), uses a single fused kernel that
+    keeps tile_mass in registers and avoids scratch buffer allocation + extra
+    kernel launch.  For larger N falls back to the two-kernel pipeline.
 
     Input tile_lse: [B, H, seq_q, N] float32 (log2 domain, per-block LSE,
         stride_row=1 from forward kernel).
@@ -207,40 +305,67 @@ def mask_from_stats_fused(
     stride_lse_b, stride_lse_h, stride_lse_row, stride_lse_n = tile_lse.stride()
     stride_slse_b, stride_slse_h, stride_slse_row = softmax_lse.stride()
 
-    # Scratch buffer for intermediate tile_mass (tiny: BH*Tm*N_PAD*4 bytes)
-    scratch = torch.empty(BH, Tm, N_PAD, device=tile_lse.device, dtype=torch.float32)
     mask_out = torch.empty(BH, Tm, N, device=tile_lse.device, dtype=torch.uint8)
-
     grid = (BH, Tm)
 
-    # Kernel 1: Reduce BLOCK_M rows → tile_mass[N] per tile
-    _reduce_tile_mass_kernel[grid](
-        tile_lse, softmax_lse, scratch,
-        H=H,
-        seq_q=seq_q,
-        stride_lse_b=stride_lse_b,
-        stride_lse_h=stride_lse_h,
-        stride_lse_row=stride_lse_row,
-        stride_lse_n=stride_lse_n,
-        stride_slse_b=stride_slse_b,
-        stride_slse_h=stride_slse_h,
-        stride_slse_row=stride_slse_row,
-        N_ACTUAL=N,
-        BLOCK_M=kBlockM_bwd,
-        BLOCK_N=min(64, N_PAD),
-        N_PAD=N_PAD,
-        Tm=Tm,
-        num_warps=4,
-    )
+    if N_PAD <= _FUSED_N_PAD_THRESHOLD:
+        # ── Fast path: single fused kernel, no scratch buffer ──────────
+        # num_warps: scale down for tiny N to avoid idle threads.
+        if N_PAD <= 32:
+            num_warps = 1
+        elif N_PAD <= 128:
+            num_warps = 2
+        else:
+            num_warps = 4
 
-    # Kernel 2: Threshold tile_mass → uint8 mask
-    _threshold_mask_kernel[grid](
-        scratch, mask_out,
-        negl_prob,
-        N_ACTUAL=N,
-        N_PAD=N_PAD,
-        Tm=Tm,
-        num_warps=4,
-    )
+        _fused_mask_kernel[grid](
+            tile_lse, softmax_lse, mask_out,
+            H=H,
+            seq_q=seq_q,
+            stride_lse_b=stride_lse_b,
+            stride_lse_h=stride_lse_h,
+            stride_lse_row=stride_lse_row,
+            stride_lse_n=stride_lse_n,
+            stride_slse_b=stride_slse_b,
+            stride_slse_h=stride_slse_h,
+            stride_slse_row=stride_slse_row,
+            negl_prob=negl_prob,
+            N_ACTUAL=N,
+            N_PAD=N_PAD,
+            BLOCK_M=kBlockM_bwd,
+            Tm=Tm,
+            num_warps=num_warps,
+        )
+    else:
+        # ── Fallback: two-kernel pipeline for large N ──────────────────
+        scratch = torch.empty(BH, Tm, N_PAD, device=tile_lse.device, dtype=torch.float32)
+
+        _reduce_tile_mass_kernel[grid](
+            tile_lse, softmax_lse, scratch,
+            H=H,
+            seq_q=seq_q,
+            stride_lse_b=stride_lse_b,
+            stride_lse_h=stride_lse_h,
+            stride_lse_row=stride_lse_row,
+            stride_lse_n=stride_lse_n,
+            stride_slse_b=stride_slse_b,
+            stride_slse_h=stride_slse_h,
+            stride_slse_row=stride_slse_row,
+            N_ACTUAL=N,
+            BLOCK_M=kBlockM_bwd,
+            BLOCK_N=min(64, N_PAD),
+            N_PAD=N_PAD,
+            Tm=Tm,
+            num_warps=4,
+        )
+
+        _threshold_mask_kernel[grid](
+            scratch, mask_out,
+            negl_prob,
+            N_ACTUAL=N,
+            N_PAD=N_PAD,
+            Tm=Tm,
+            num_warps=4,
+        )
 
     return mask_out.view(B, H, Tm, N)
