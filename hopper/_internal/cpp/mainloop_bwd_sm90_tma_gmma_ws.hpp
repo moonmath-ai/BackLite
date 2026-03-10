@@ -321,7 +321,7 @@ struct CollectiveMainloopBwdSm90 {
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
         // Block sparsity mask — column-transposed [B, H, C, R] uint8
-        uint8_t const* const ptr_block_mask = nullptr;
+        uint32_t const* const ptr_block_mask = nullptr;
         int const num_row_tiles = 0;
         int const num_col_tiles = 0;
     };
@@ -355,7 +355,7 @@ struct CollectiveMainloopBwdSm90 {
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
         // Block sparsity mask — column-transposed [B, H, C, R] uint8
-        uint8_t const* const ptr_block_mask = nullptr;
+        uint32_t const* const ptr_block_mask = nullptr;
         int const num_row_tiles = 0;
         int const num_col_tiles = 0;
     };
@@ -427,28 +427,61 @@ struct CollectiveMainloopBwdSm90 {
         cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
     }
 
-    // ── Block-sparsity mask helpers ────────────────────────────────────────
-    // Returns pointer to the mask column for n_block, or nullptr when no mask.
-    // Mask layout is [B, H, C, R] (column-major) — stride-1 along R dimension.
-    CUTLASS_DEVICE static uint8_t const*
-    get_mask_col(Params const& params, int bidb, int bidh, int n_block) {
-        if (params.ptr_block_mask == nullptr) return nullptr;
-        int num_heads = get<2>(params.shape_Q);
-        return params.ptr_block_mask
-            + (int64_t(bidb) * num_heads + bidh) * params.num_col_tiles * params.num_row_tiles
-            + n_block * params.num_row_tiles;
-    }
+    // ── Block-sparsity mask helpers (streaming multi-word bitmask) ──────────
+    // Layout: ptr_block_mask[( bidb*H + bidh ) * num_col_tiles * num_mask_words
+    //                        + n_block * num_mask_words + word]
+    // Bit (m % 32) of word (m / 32) is set iff Q-block m is active.
+    // num_mask_words = params.num_row_tiles  (repurposed field).
+    //
+    // MaskBits stores only a pointer + num_words (2 registers).  Words are loaded
+    // on-demand via __ldg (read-only L2 cache) in next_active — zero fixed-array
+    // allocation, scales to arbitrary Tm.  L2 latency is hidden by the TMA
+    // pipeline stalls surrounding each bwd_step call.
+    struct MaskBits {
+        uint32_t const* ptr;  // nullptr = all active (no mask)
+        int num_words;        // number of uint32 words; 0 when ptr == nullptr
 
-    // Advance to the next active m-block by scanning mask bytes from position m.
-    // mask_col == nullptr means no mask → every tile is active (return m).
-    __device__ static __forceinline__ int
-    next_active_m(uint8_t const* __restrict__ mask_col, int m, int m_end) {
-        if (mask_col == nullptr) return m;        // no mask → dense path
-        #pragma unroll 1
-        for (int i = m; i < m_end; ++i) {
-            if (__ldg(&mask_col[i])) return i;    // read-only texture cache
+        // True iff Q-block m is active.
+        CUTLASS_DEVICE bool is_active(int m) const {
+            if (ptr == nullptr) return true;
+            int w = m >> 5;
+            if (w >= num_words) return false;
+            return (__ldg(ptr + w) >> (m & 31)) & 1u;
         }
-        return m_end;
+
+        // Smallest i in [m, m_end) with bit i set, or m_end if none.
+        // Loads each 32-bit word on-demand via __ldg; uses __ffs for O(1) per word.
+        // For the no-mask case, returns m immediately (zero memory access).
+        CUTLASS_DEVICE int next_active(int m, int m_end) const {
+            if (ptr == nullptr) return m;   // all active — no memory access
+            for (int cur_m = m; cur_m < m_end; ) {
+                int w   = cur_m >> 5;
+                int bit = cur_m & 31;
+                if (w >= num_words) break;
+                uint32_t remaining = __ldg(ptr + w) >> bit;
+                int limit = m_end - (w * 32 + bit);   // > 0 since cur_m < m_end
+                if (limit < 32) remaining &= (1u << limit) - 1u;
+                if (remaining) return w * 32 + bit + __ffs(remaining) - 1;
+                cur_m = (w + 1) * 32;  // advance to next word boundary
+            }
+            return m_end;
+        }
+    };
+
+    // Build a MaskBits for (bidb, bidh, n_block): stores pointer + word count.
+    // No data loaded at startup — words are fetched lazily in next_active.
+    CUTLASS_DEVICE static MaskBits
+    get_mask_words(Params const& params, int bidb, int bidh, int n_block) {
+        if (params.ptr_block_mask == nullptr) {
+            return {nullptr, 0};
+        }
+        int num_heads = get<2>(params.shape_Q);
+        int num_words = params.num_row_tiles;   // num_mask_words
+        int num_cols  = params.num_col_tiles;   // N
+        return {params.ptr_block_mask
+                + (int64_t(bidb) * num_heads + bidh) * num_cols * num_words
+                + n_block * num_words,
+                num_words};
     }
 
     template <typename SchedulerPrefetch, typename SharedStorage>
@@ -478,8 +511,8 @@ struct CollectiveMainloopBwdSm90 {
                 return;
             }
         }
-        auto mask_col = get_mask_col(params, bidb, bidh, n_block);
-        int m_block_first = next_active_m(mask_col, m_block_min, m_block_max);
+        MaskBits active = get_mask_words(params, bidb, bidh, n_block);
+        int m_block_first = active.next_active( m_block_min, m_block_max);
         if (m_block_first >= m_block_max) {
             scheduler_prefetch();
             return;
@@ -573,7 +606,7 @@ struct CollectiveMainloopBwdSm90 {
                 copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
                      gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
                 if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
-                m_block = next_active_m(mask_col, m_block + 1, m_block_max);
+                m_block = active.next_active( m_block + 1, m_block_max);
                 ++smem_pipe_write;
                 if (m_block >= m_block_max) { break; }
                 pipeline_q.producer_acquire(smem_pipe_write);
@@ -640,8 +673,8 @@ struct CollectiveMainloopBwdSm90 {
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return; }
         }
-        auto mask_col = get_mask_col(params, bidb, bidh, n_block);
-        int m_block = next_active_m(mask_col, m_block_min, m_block_max);
+        MaskBits active = get_mask_words(params, bidb, bidh, n_block);
+        int m_block = active.next_active( m_block_min, m_block_max);
 
         Tensor sdQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_dqacc.data()), SmemLayoutdQaccum{});
         static constexpr int dQ_TMA_num_bytes = CUTE_STATIC_V(size<0>(sdQ)) * sizeof(ElementAccum);
@@ -693,14 +726,14 @@ struct CollectiveMainloopBwdSm90 {
                     if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(warpgroup_idx)>(); }
                     cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);  // sdQ empty, ready to be written to
                 });
-                m_block = next_active_m(mask_col, m_block + 1, m_block_max);
+                m_block = active.next_active( m_block + 1, m_block_max);
             }
             return;
         }
         // Deterministic: iterate ALL m-blocks for barrier ordering, check mask per tile
         #pragma unroll 2
         for (int m_blk = m_block_min; m_blk < m_block_max; ++m_blk) {
-            bool const is_block_active = mask_col == nullptr || mask_col[m_blk] != 0;
+            bool const is_block_active = active.is_active(m_blk);
             if constexpr (Deterministic) {
                 Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_blk * num_batch * num_head, n_block);
             }
@@ -881,8 +914,8 @@ struct CollectiveMainloopBwdSm90 {
         );
 
         // Block sparsity — byte-pointer for next-active-m scanning
-        auto mask_col = get_mask_col(params, bidb, bidh, n_block);
-        int m_block = next_active_m(mask_col, m_block_min, m_block_max);
+        MaskBits active = get_mask_words(params, bidb, bidh, n_block);
+        int m_block = active.next_active( m_block_min, m_block_max);
         if (m_block >= m_block_max) { return false; }
 
         clear(tdKrdK);
@@ -1080,7 +1113,7 @@ struct CollectiveMainloopBwdSm90 {
             CUTLASS_PRAGMA_NO_UNROLL
             while (m_block < m_block_end) {
                 bwd_step(m_block, mask_fn);
-                m_block = next_active_m(mask_col, m_block + 1, m_block_max);
+                m_block = active.next_active( m_block + 1, m_block_max);
             }
         }
 
@@ -1094,7 +1127,7 @@ struct CollectiveMainloopBwdSm90 {
         CUTLASS_PRAGMA_NO_UNROLL
         while (m_block < m_block_max_before_local_mask) {
             bwd_step(m_block, mask_fn);
-            m_block = next_active_m(mask_col, m_block + 1, m_block_max);
+            m_block = active.next_active( m_block + 1, m_block_max);
         }
 
         if constexpr (Is_local && SeparateMaskingIterations) {
@@ -1102,7 +1135,7 @@ struct CollectiveMainloopBwdSm90 {
             CUTLASS_PRAGMA_NO_UNROLL
             while (m_block < m_block_max) {
                 bwd_step(m_block, mask_fn);
-                m_block = next_active_m(mask_col, m_block + 1, m_block_max);
+                m_block = active.next_active( m_block + 1, m_block_max);
             }
         }
 

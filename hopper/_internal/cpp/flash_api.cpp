@@ -1661,26 +1661,38 @@ inline std::tuple<int, int> tile_size_bwd(int arch, int head_size_rounded, bool 
     TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
     #endif
 
-    // Block sparsity mask — transpose to column-major [B, H, C, R] for stride-1 kernel access
-    at::Tensor block_mask_T;
+    // Block sparsity mask — packed int32 bitmask [B, H, N, num_words]
+    at::Tensor block_mask_contig;
     at::Tensor work_remap_tensor;
     if (block_mask_.has_value()) {
         auto block_mask = block_mask_.value();
         CHECK_DEVICE(block_mask);
-        TORCH_CHECK(block_mask.dtype() == torch::kUInt8, "block_mask must be uint8");
-        TORCH_CHECK(block_mask.dim() == 4, "block_mask must have 4 dimensions [batch, head, num_row_tiles, num_col_tiles]");
-        params.num_row_tiles = block_mask.size(2);
-        params.num_col_tiles = block_mask.size(3);
-        block_mask_T = block_mask.permute({0, 1, 3, 2}).contiguous();
-        params.ptr_block_mask = static_cast<uint8_t const*>(block_mask_T.data_ptr());
+        TORCH_CHECK(block_mask.dtype() == torch::kInt32, "block_mask must be int32 bitmask [B, H, N, num_words]");
+        TORCH_CHECK(block_mask.dim() == 4, "block_mask must have 4 dimensions [batch, head, num_col_tiles, num_mask_words]");
+        int num_words = block_mask.size(3);
+        params.num_row_tiles = num_words;   // num_mask_words
+        params.num_col_tiles = block_mask.size(2);
+        block_mask_contig = block_mask.contiguous();
+        params.ptr_block_mask = static_cast<uint32_t const*>(block_mask_contig.data_ptr());
 
         if (params.num_col_tiles >= bwd_sorted_remap_min_col_tiles()) {
-            // Sorted CTA scheduling: sort columns by active row count within each
-            // (batch, head) slice, keeping heads contiguous to preserve L2 locality.
-            // block_mask is [B, H, num_m, num_n].  Sum over m → [B, H, num_n].
-            int num_n = block_mask.size(3);
+            // Sorted CTA scheduling: sort KV columns by active Q-block count.
+            // block_mask is int32[B, H, N, num_words]; sum popcounts over words per column.
+            int num_n = block_mask.size(2);
             int bh = block_mask.size(0) * block_mask.size(1);  // B * H
-            auto active_count = block_mask.to(torch::kFloat32).sum(/*dim=*/2);  // [B, H, num_n]
+            // This path only fires for N >= 256 (not our common config), so CPU cost is fine.
+            auto bm_cpu = block_mask.reshape({bh, num_n * num_words}).to(torch::kInt32).cpu().contiguous();
+            auto active_count_cpu = torch::zeros({bh, num_n}, torch::dtype(torch::kFloat32));
+            {
+                auto bm_acc = bm_cpu.accessor<int32_t, 2>();
+                auto ac_acc = active_count_cpu.accessor<float, 2>();
+                for (int i = 0; i < bh; ++i)
+                    for (int j = 0; j < num_n; ++j)
+                        for (int w = 0; w < num_words; ++w)
+                            ac_acc[i][j] += (float)__builtin_popcount((unsigned)bm_acc[i][j * num_words + w]);
+            }
+            auto active_count = active_count_cpu.to(block_mask.device())
+                                    .reshape({block_mask.size(0), block_mask.size(1), num_n});
             // Sort within each (B, H) slice along dim=-1 (column dimension)
             auto sorted_result = active_count.reshape({bh, num_n}).sort(/*dim=*/1, /*descending=*/true);
             auto sorted_col_idx = std::get<1>(sorted_result);  // [B*H, num_n] — column indices per head

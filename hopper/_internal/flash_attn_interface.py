@@ -57,9 +57,16 @@ def _generate_mask_from_stats_mass(tile_stats, seq_q, head_dim, head_dim_v, dtyp
     if seq_q % kBlockM_bwd != 0: raise RuntimeError(f"Mask generation requires seq_q divisible by kBlockM_bwd (seq_q={seq_q}, kBlockM_bwd={kBlockM_bwd}).")
 
     mask = _mask_from_stats_fused(tile_lse, softmax_lse, num_row_tiles_bwd, kBlockM_bwd, negl_prob).contiguous()
+    # mask is int32[B, H, N, num_words] bitmask
 
     if os.environ.get('DEBUG_BACKLITE_SPARSITY'):
-        stats = compute_sparsity(tile_stats, mask, seq_q, is_causal=is_causal)
+        # Reconstruct uint8[B, H, Tm, N] view from the int32 bitmask for sparsity stats
+        B_m, H_m, N_m, num_words = mask.shape
+        mask_u8 = torch.zeros(B_m, H_m, num_row_tiles_bwd, N_m, dtype=torch.uint8, device=mask.device)
+        for m in range(num_row_tiles_bwd):
+            w, bit = m // 32, m % 32
+            mask_u8[:, :, m, :] = ((mask[..., w] >> bit) & 1).to(torch.uint8)
+        stats = compute_sparsity(tile_stats, mask_u8, seq_q, is_causal=is_causal)
         mode = "causal" if is_causal else ("local" if is_local else "full")
         print(f"[BackLite] mode={mode}  overall_sparsity={stats['causal_sparsity']:.2%}  additional_sparsity={stats['additional_sparsity']:.2%}")
 
