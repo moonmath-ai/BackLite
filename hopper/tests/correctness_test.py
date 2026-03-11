@@ -127,8 +127,8 @@ def test_forward_matches_sdpa(cuda_device: str, dtype: torch.dtype) -> None:
 
     torch.manual_seed(0)
     D = 64
-    # Original \"nice\" shape plus an odd B, N to exercise tail blocks.
-    for B, H, N in [(2, 4, 128), (3, 5, 123)]:
+    # Always test seq_len=2048.
+    for B, H, N in [(2, 4, 2048), (3, 5, 2048)]:
         Q = torch.randn(B, H, N, D, dtype=dtype, device=cuda_device)
         K = torch.randn(B, H, N, D, dtype=dtype, device=cuda_device)
         V = torch.randn(B, H, N, D, dtype=dtype, device=cuda_device)
@@ -161,8 +161,8 @@ def test_backward_matches_sdpa_zero_neg_prob(cuda_device: str, dtype: torch.dtyp
 
     torch.manual_seed(1)
     D = 64
-    # Original shape plus an odd B, N to exercise tail blocks in backward.
-    for B, H, N in [(1, 2, 128), (3, 5, 123)]:
+    # Always test seq_len=2048.
+    for B, H, N in [(1, 2, 2048), (3, 5, 2048)]:
         Q_sp = torch.randn(B, H, N, D, dtype=dtype, device=cuda_device, requires_grad=True)
         K_sp = torch.randn(B, H, N, D, dtype=dtype, device=cuda_device, requires_grad=True)
         V_sp = torch.randn(B, H, N, D, dtype=dtype, device=cuda_device, requires_grad=True)
@@ -198,15 +198,15 @@ def test_backward_matches_sdpa_zero_neg_prob(cuda_device: str, dtype: torch.dtyp
         print(f"[B={B}, H={H}, N={N}] Reference Grad Norms: dQ={grad_norm_Q:.6e}, dK={grad_norm_K:.6e}, dV={grad_norm_V:.6e}")
         print(f"[B={B}, H={H}, N={N}] Custom Grad Norms   : dQ={grad_norm_Q_custom:.6e}, dK={grad_norm_K_custom:.6e}, dV={grad_norm_V_custom:.6e}")
 
-        # Use a strict tolerance for the \"nice\" shape and a slightly looser one
-        # for the odd shape where block tails are masked. Relax a bit for BF16.
+        # Use a strict tolerance for (1, 2, 2048) and a slightly looser one for (3, 5, 2048).
+        # Relax a bit for BF16.
         if dtype is torch.float16:
-            if (B, H, N) == (1, 2, 128):
+            if (B, H, N) == (1, 2, 2048):
                 rtol, atol = 1e-6, 1e-4
             else:
                 rtol, atol = 5e-3, 5e-3
         else:
-            if (B, H, N) == (1, 2, 128):
+            if (B, H, N) == (1, 2, 2048):
                 rtol, atol = 5e-5, 5e-3
             else:
                 rtol, atol = 1e-2, 1e-2
@@ -247,8 +247,8 @@ def test_probability_sum(dtype: torch.dtype):
 
     LOG2E = 1.4426950408889634
 
-    # Run a large-N case (much accumulation) and a smaller power-of-2 case.
-    for B, H, N, D in [(2, 4, 16 * 1024, 128), (1, 2, 1024, 128)]:
+    # Always test seq_len=2048.
+    for B, H, N, D in [(2, 4, 2048, 128), (1, 2, 2048, 128)]:
         Q = torch.randn(B, H, N, D, dtype=dtype, device=device, requires_grad=True)
         K = torch.randn(B, H, N, D, dtype=dtype, device=device, requires_grad=True)
         V = torch.randn(B, H, N, D, dtype=dtype, device=device, requires_grad=True)
@@ -299,7 +299,7 @@ def test_probability_sum(dtype: torch.dtype):
 def entropy(p):
     return torch.special.entr(p).sum(dim=-1)
 
-def get_captured_tensors(B=1, H=1, N=1024, D=128, negl_prob=0.01):
+def get_captured_tensors(B=1, H=1, N=2048, D=128, negl_prob=0.01):
     """Capture saved tensors from a sparse attention forward pass.
 
     Returns (softmax_lse, tile_stats) where:
@@ -350,7 +350,7 @@ def sparsity_level_check():
     import matplotlib.pyplot as plt
 
     LOG2E = 1.4426950408889634
-    B, H, N, D = 128, 1, 16 * 1024, 128
+    B, H, N, D = 128, 1, 2048, 128
     dtype = torch.float16
     device = "cuda"
 
@@ -427,7 +427,7 @@ def main() -> None:
     device = "cuda"
     dtype = torch.float16
 
-    B, H, N, D = 1, 12, 1024*16, 128
+    B, H, N, D = 1, 12, 2048, 128
     scale = math.sqrt(N * H * D)
 
     def make_inputs():

@@ -46,11 +46,11 @@ D = 128
 H = 13
 NEGL_PROB = 0.3
 DEVICE = "cuda"
-# WARMUP = 200
-# REPEATS = 500
+WARMUP = 200
+REPEATS = 500
 
-WARMUP = 0
-REPEATS = 1
+# WARMUP = 0
+# REPEATS = 1
 
 torch.manual_seed(42)
 
@@ -66,7 +66,7 @@ def bench_interleaved(fn_a, fn_b, warmup=WARMUP, repeats=REPEATS):
         torch.cuda.synchronize()
         fn_a()
         torch.cuda.synchronize()
-        # fn_b()
+
     torch.cuda.synchronize()
 
     # Pre-allocate all events
@@ -105,7 +105,9 @@ for causal, window_size, label in [
     print(f"{'B':>4}  {'T':>5}  {'FA3 p50':>10}  {'BL p50':>10}  {'Speedup':>8}  {'FA3 p10':>9}  {'BL p10':>8}")
     print("-" * 70)
 
-    for B, T in [(4, 2048), (2, 4096), (1, 8192), (4, 4096), (2, 8192)]:
+    # for B, T in [(16, 2048), (16, 4096), (16, 8192), (16, 4096), (16, 8192)]:
+    # for B, T in [(4, 2048), (2, 4096), (1, 8192), (4, 4096), (2, 8192)]:
+    for B, T in [(16, 2048)]:
         q = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
         k = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
         v = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
