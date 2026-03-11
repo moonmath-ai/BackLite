@@ -62,8 +62,11 @@ def bench_interleaved(fn_a, fn_b, warmup=WARMUP, repeats=REPEATS):
     """
     # Warmup both equally
     for _ in range(warmup):
-        fn_a()
         fn_b()
+        torch.cuda.synchronize()
+        fn_a()
+        torch.cuda.synchronize()
+        # fn_b()
     torch.cuda.synchronize()
 
     # Pre-allocate all events
@@ -74,8 +77,10 @@ def bench_interleaved(fn_a, fn_b, warmup=WARMUP, repeats=REPEATS):
 
     # Interleaved measurement
     for i in range(repeats):
-        starts_a[i].record(); fn_a(); ends_a[i].record()
         starts_b[i].record(); fn_b(); ends_b[i].record()
+        torch.cuda.synchronize()
+        starts_a[i].record(); fn_a(); ends_a[i].record()
+        torch.cuda.synchronize()
     torch.cuda.synchronize()
 
     times_a = sorted(starts_a[i].elapsed_time(ends_a[i]) for i in range(repeats))
