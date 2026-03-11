@@ -16,6 +16,7 @@
  #include "heuristics.h"
  #include "cuda_check.h"
  #include "quant.h"
+ #include "mask_compute.h"
  
  
  extern "C" {
@@ -47,7 +48,7 @@
  namespace {
 int bwd_sorted_remap_min_col_tiles() {
     static int min_col_tiles = []() {
-        constexpr int kDefaultMinColTiles = 256;
+        constexpr int kDefaultMinColTiles = 4;
         const char* env = std::getenv("BACK_LITE_BWD_SORT_REMAP_MIN_COL_TILES");
         if (env == nullptr) { return kDefaultMinColTiles; }
         char* endptr = nullptr;
@@ -58,7 +59,10 @@ int bwd_sorted_remap_min_col_tiles() {
      return min_col_tiles;
  }
  }  // namespace
- 
+
+ // Forward declaration (defined later in this file)
+ std::vector<int64_t> get_tile_size_bwd(int64_t, int64_t, bool, bool, bool);
+
  void set_params_fprop(Flash_fwd_params &params,
                        // sizes
                        const size_t b,
@@ -1415,7 +1419,9 @@ inline std::tuple<int, int> tile_size_bwd(int arch, int head_size_rounded, bool 
      double softcap,
      bool deterministic,
      int64_t sm_margin,
-     std::optional<at::Tensor> block_mask_ = std::nullopt
+     std::optional<at::Tensor> block_mask_ = std::nullopt,
+     std::optional<at::Tensor> tile_stats_ = std::nullopt,
+     double negl_prob = 0.0
  ) {
  
      #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -1662,8 +1668,24 @@ inline std::tuple<int, int> tile_size_bwd(int arch, int head_size_rounded, bool 
     #endif
 
     // Block sparsity mask — packed int32 bitmask [B, H, N, num_words]
+    // Compute inline from tile_stats when no precomputed block_mask is provided.
     at::Tensor block_mask_contig;
     at::Tensor work_remap_tensor;
+    at::Tensor inline_block_mask;
+    if (!block_mask_.has_value() && tile_stats_.has_value() && negl_prob > 0.0) {
+        auto tile_stats = tile_stats_.value();
+        CHECK_DEVICE(tile_stats);
+        TORCH_CHECK(tile_stats.dtype() == torch::kFloat32, "tile_stats must be float32");
+        TORCH_CHECK(tile_stats.dim() == 4, "tile_stats must be [B, H, T, N]");
+        bool has_softcap = params.softcap > 0.0;
+        bool is_local_not_causal = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+        auto bwd_tile = get_tile_size_bwd(params.d, params.dv, is_causal, is_local_not_causal, has_softcap);
+        int kBlockM_bwd = static_cast<int>(bwd_tile[0]);
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        inline_block_mask = compute_block_mask_from_tile_stats(
+            tile_stats, softmax_lse, kBlockM_bwd, static_cast<float>(negl_prob), stream);
+        block_mask_ = inline_block_mask;
+    }
     if (block_mask_.has_value()) {
         auto block_mask = block_mask_.value();
         CHECK_DEVICE(block_mask);
@@ -1677,29 +1699,23 @@ inline std::tuple<int, int> tile_size_bwd(int arch, int head_size_rounded, bool 
 
         if (params.num_col_tiles >= bwd_sorted_remap_min_col_tiles()) {
             // Sorted CTA scheduling: sort KV columns by active Q-block count.
-            // block_mask is int32[B, H, N, num_words]; sum popcounts over words per column.
+            // Compute popcount entirely on GPU (no CPU sync needed).
             int num_n = block_mask.size(2);
-            int bh = block_mask.size(0) * block_mask.size(1);  // B * H
-            // This path only fires for N >= 256 (not our common config), so CPU cost is fine.
-            auto bm_cpu = block_mask.reshape({bh, num_n * num_words}).to(torch::kInt32).cpu().contiguous();
-            auto active_count_cpu = torch::zeros({bh, num_n}, torch::dtype(torch::kFloat32));
-            {
-                auto bm_acc = bm_cpu.accessor<int32_t, 2>();
-                auto ac_acc = active_count_cpu.accessor<float, 2>();
-                for (int i = 0; i < bh; ++i)
-                    for (int j = 0; j < num_n; ++j)
-                        for (int w = 0; w < num_words; ++w)
-                            ac_acc[i][j] += (float)__builtin_popcount((unsigned)bm_acc[i][j * num_words + w]);
-            }
-            auto active_count = active_count_cpu.to(block_mask.device())
-                                    .reshape({block_mask.size(0), block_mask.size(1), num_n});
-            // Sort within each (B, H) slice along dim=-1 (column dimension)
-            auto sorted_result = active_count.reshape({bh, num_n}).sort(/*dim=*/1, /*descending=*/true);
-            auto sorted_col_idx = std::get<1>(sorted_result);  // [B*H, num_n] — column indices per head
-            // Build bidhb index: [B*H, num_n] where each row has the same bidhb value
+            int bh = block_mask.size(0) * block_mask.size(1);
+
+            // GPU-side popcount via Hamming weight on int32 words.
+            auto bm = block_mask_contig.reshape({bh, num_n, num_words}).to(torch::kInt64);
+            auto x = bm - (at::bitwise_right_shift(bm, 1) & 0x55555555LL);
+            x = (x & 0x33333333LL) + (at::bitwise_right_shift(x, 2) & 0x33333333LL);
+            x = (x + at::bitwise_right_shift(x, 4)) & 0x0F0F0F0FLL;
+            x = at::bitwise_right_shift(x * 0x01010101LL, 24);
+            auto active_count = x.sum(/*dim=*/2).to(torch::kFloat32);  // [bh, num_n]
+
+            // Sort within each (B, H) slice along dim=-1 (column dimension), descending
+            auto sorted_result = active_count.sort(/*dim=*/1, /*descending=*/true);
+            auto sorted_col_idx = std::get<1>(sorted_result);
             auto bidhb_range = torch::arange(bh, block_mask.options().dtype(torch::kLong))
                                    .unsqueeze(1).expand({bh, num_n});
-            // Pack: upper 16 bits = bidhb, lower 16 bits = n_block
             auto packed = bidhb_range.to(torch::kInt32) * 65536 + sorted_col_idx.to(torch::kInt32);
             work_remap_tensor = packed.reshape({-1}).contiguous();
             params.work_remap = work_remap_tensor.data_ptr<int32_t>();
@@ -2014,7 +2030,9 @@ quantize_qk(
         "float softcap = 0.0,"
         "bool deterministic = False,"
         "int sm_margin = 0,"
-        "Tensor? block_mask = None) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "Tensor? block_mask = None,"
+        "Tensor? tile_stats = None,"
+        "float negl_prob = 0.0) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
      m.def("fwd_combine("
          "Tensor out_partial,"
          "Tensor lse_partial,"

@@ -21,6 +21,29 @@ def maybe_contiguous(x):
 from back_lite._internal.tile_stats_reduce import mask_from_stats_fused as _mask_from_stats_fused
 
 
+# ── Tile-stats buffer cache ──────────────────────────────────────────────
+# Pre-filled -inf template avoids a fill kernel on every forward call.
+# The template is allocated once per (shape, device) and cloned each call.
+_tile_stats_template_cache: dict = {}
+
+def _get_tile_stats_buffer(batch: int, heads: int, num_n_blocks: int, seq_q: int,
+                           device: torch.device) -> torch.Tensor:
+    """Return a fresh [B,H,T,N] tile_stats tensor pre-filled with -inf.
+
+    Clones from a cached template so the -inf fill kernel only runs once per
+    unique shape (which is once total during fixed-shape training).
+    """
+    key = (batch, heads, num_n_blocks, seq_q, device)
+    tpl = _tile_stats_template_cache.get(key)
+    if tpl is None:
+        tpl = torch.full(
+            (batch, heads, num_n_blocks, seq_q), float('-inf'),
+            device=device, dtype=torch.float32,
+        ).permute(0, 1, 3, 2)  # [B,H,T,N] with stride_m=1
+        _tile_stats_template_cache[key] = tpl
+    return tpl.clone()
+
+
 def _mask_from_stats_compiled(tile_lse, softmax_lse, num_row_tiles, kBlockM_bwd, negl_prob):
     """Mask generation from cumulative LSE.  Delegates to fused Triton kernel."""
     return _mask_from_stats_fused(tile_lse, softmax_lse, num_row_tiles, kBlockM_bwd, negl_prob)
@@ -239,6 +262,8 @@ def _flash_attn_backward(
         deterministic=False,
         sm_margin=0,
         block_mask=None,
+        tile_stats=None,
+        negl_prob=0.0,
 ):
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
@@ -266,6 +291,8 @@ def _flash_attn_backward(
         deterministic,
         sm_margin,
         block_mask=block_mask,
+        tile_stats=tile_stats,
+        negl_prob=negl_prob,
     )
     return dq, dk, dv, softmax_d
 
@@ -301,13 +328,9 @@ def _back_lite_fwd(
     if _sparse:
         batch, seq_q, heads, head_dim = q.shape
         num_n_blocks = (k.shape[1] + block_n_size - 1) // block_n_size
-        tile_stats: Optional[torch.Tensor] = torch.full(
-            (batch, heads, num_n_blocks, seq_q), float('-inf'),
-            device=q.device, dtype=torch.float32,
-        ).permute(0, 1, 3, 2)  # [B,H,T,N] with stride_m=1 (non-contiguous is intentional)
-        # NOTE: do NOT call .contiguous() here – permute gives stride_m=1 which the
-        # FA3 forward kernel requires when writing tile_stats.  Calling .contiguous()
-        # would relayout to stride_m=N, causing cudaErrorMisalignedAddress in the kernel.
+        tile_stats: Optional[torch.Tensor] = _get_tile_stats_buffer(
+            batch, heads, num_n_blocks, seq_q, q.device,
+        )
     else:
         tile_stats = None
 
@@ -383,14 +406,9 @@ def _back_lite_bwd(
     sm_margin: int,
     negl_prob: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    block_mask = None
-    if negl_prob > 0.0 and tile_stats.dim() == 4:
-        is_local = (window_size_left >= 0 or window_size_right >= 0) and not causal
-        block_mask = _generate_mask_from_stats_mass(
-            tile_stats, q.shape[1], q.shape[-1], v.shape[-1], q.dtype, negl_prob,
-            is_causal=causal, is_local=is_local, softcap=softcap,
-            device=q.device, softmax_lse=softmax_lse,
-        )
+    # Pass tile_stats + negl_prob directly to C++; the mask is computed inline
+    # by a compiled CUDA kernel, eliminating the Python/Triton roundtrip.
+    ts = tile_stats if (negl_prob > 0.0 and tile_stats.dim() == 4) else None
 
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
@@ -404,7 +422,8 @@ def _back_lite_bwd(
         softmax_scale, causal,
         (window_size_left, window_size_right),
         softcap, deterministic, sm_margin,
-        block_mask=block_mask,
+        tile_stats=ts,
+        negl_prob=negl_prob,
     )
     dq = dq[..., :q.shape[-1]]
     dk = dk[..., :k.shape[-1]]
@@ -598,17 +617,9 @@ class FlashAttnFunc(torch.autograd.Function):
             )
             kBlockM, kBlockN = result[0], result[1]
             num_n_blocks = (k.shape[1] + kBlockN - 1) // kBlockN
-            # Per-row tile LSE stats: logical shape [batch, heads, seq_q, num_n_blocks].
-            # Must be -inf so causally-masked positions (never written by fwd kernel)
-            # yield exp(-inf)=0 mass instead of garbage from uninitialized memory.
-            #
-            # Allocate as [B,H,N,T] then permute to [B,H,T,N].
-            # This gives stride_m=1 (row dimension is innermost in memory),
-            # so the forward kernel writes are coalesced.
-            tile_stats = torch.full(
-                (batch, heads, num_n_blocks, seq_q), float('-inf'),
-                device=q.device, dtype=torch.float32
-            ).permute(0, 1, 3, 2)  # shape [B,H,T,N], stride_m=1
+            tile_stats = _get_tile_stats_buffer(
+                batch, heads, num_n_blocks, seq_q, q.device,
+            )
 
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
@@ -659,20 +670,13 @@ class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         saved = ctx.saved_tensors
-        # Unpack saved tensors: q, k, v, out, softmax_lse, [tile_stats or None], [*rest]
         q, k, v, out, softmax_lse = saved[0], saved[1], saved[2], saved[3], saved[4]
-        block_mask = None
         negl_prob = getattr(ctx, 'negl_prob', 0.0)
+        tile_stats = None
         if negl_prob > 0 and len(saved) > 5:
-            tile_stats = saved[5]
-            # tile_stats: [B, H, seq_q, num_n_blocks] float32
-            if tile_stats is not None and tile_stats.dim() == 4 and tile_stats.dtype == torch.float32:
-                is_local = (ctx.window_size[0] >= 0 or ctx.window_size[1] >= 0) and not ctx.causal
-                block_mask = _generate_mask_from_stats_mass(
-                    tile_stats, q.shape[1], q.shape[-1], ctx.head_dim_v, ctx.q_dtype, negl_prob,
-                    is_causal=ctx.causal, is_local=is_local, softcap=ctx.softcap,
-                    device=q.device, softmax_lse=softmax_lse,
-                )
+            ts = saved[5]
+            if ts is not None and ts.dim() == 4 and ts.dtype == torch.float32:
+                tile_stats = ts
 
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
@@ -695,7 +699,8 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
-            block_mask=block_mask,
+            tile_stats=tile_stats,
+            negl_prob=negl_prob,
         )
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]

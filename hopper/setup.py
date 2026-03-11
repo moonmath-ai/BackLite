@@ -530,7 +530,7 @@ if not SKIP_CUDA_BUILD:
         sources_bwd_sm90 = []
         sources_bwd_sm80 = []
     sources = (
-        ["_internal/cpp/flash_api.cpp"]
+        ["_internal/cpp/flash_api.cpp", "_internal/cpp/mask_compute.cu"]
         + (sources_fwd_sm80 if not DISABLE_SM8x else []) + sources_fwd_sm90
         + (sources_bwd_sm80 if not DISABLE_SM8x else []) + sources_bwd_sm90
     )

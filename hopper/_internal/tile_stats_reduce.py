@@ -12,8 +12,8 @@ Pipeline:
         → int32[B, H, N, NUM_WORDS] bitmask
 
 Grid = (BH, N): one CTA per (batch-head, KV-block).  Each CTA loops over all
-Tm Q-tiles, accumulates tile_mass[Tm] in registers, normalizes + sorts +
-thresholds, then packs into NUM_WORDS int32 words — no scratch buffer.
+Tm Q-tiles, accumulates tile_mass[Tm] in registers, then applies a sortless
+per-tile threshold and packs into NUM_WORDS int32 words — no scratch buffer.
 """
 
 import torch
@@ -35,7 +35,7 @@ def _next_power_of_2(n: int) -> int:
 # Fused bitmask kernel — grid=(BH, N), emits int32[BH, N, NUM_WORDS]
 #
 # For each KV-block n, loops over Tm Q-tiles → computes tile_mass[Tm] in
-# registers → normalizes + sorts + thresholds → packs into NUM_WORDS int32 words.
+# registers → sortless per-tile threshold → packs into NUM_WORDS int32 words.
 # ══════════════════════════════════════════════════════════════════════════
 @triton.jit
 def _fused_bitmask_kernel(
@@ -100,27 +100,14 @@ def _fused_bitmask_kernel(
         # vectorized compare+select (one warp op over TM_PAD elements) — not a loop.
         tile_mass = tl.where(tl.arange(0, TM_PAD) == m, mass_m, tile_mass)
 
-    # ── Normalize + sort + cumsum + threshold → active[TM_PAD] ─────────────
+    # ── Sortless per-tile threshold → active[TM_PAD] ───────────────────────
+    # Drop tile m if its probability mass < negl_prob.  O(Tm) — no sort needed.
     valid_m   = tl.arange(0, TM_PAD) < Tm
     total     = tl.sum(tile_mass)
     tile_prob = tile_mass / tl.maximum(total, 1e-20)
     tile_prob = tl.where(valid_m, tile_prob, 0.0)
 
-    sorted_prob = tl.sort(tile_prob)
-    csum        = tl.cumsum(sorted_prob, axis=0)
-
-    budget_mask      = csum < negl_prob
-    n_to_ignore      = tl.sum(budget_mask.to(tl.int32))
-    threshold        = tl.max(tl.where(budget_mask, sorted_prob, float('-inf')))
-
-    n_strictly_below = tl.sum((tile_prob < threshold).to(tl.int32))
-    n_ties_to_ignore = n_to_ignore - n_strictly_below
-    at_threshold     = (tile_prob == threshold)
-    tie_cumcount     = tl.cumsum(at_threshold.to(tl.int32), axis=0)
-    ignore_tie       = at_threshold & (tie_cumcount <= n_ties_to_ignore)
-
-    ignore = (tile_prob < threshold) | ignore_tie
-    active = tl.where(ignore, 0, 1)
+    active = tl.where(tile_prob >= negl_prob, 1, 0)
     active = tl.where(total > 1e-12, active, 1)  # keep all when no attention
 
     # ── Pack active[TM_PAD] → NUM_WORDS int32 bitmask words ─────────────────
@@ -139,9 +126,9 @@ def _fused_bitmask_kernel(
 
 
 # Max Tm supported by the bitmask kernel.
-# Bounded by tl.sort's limit (2048 elements) — TM_PAD must be a power-of-2 ≤ 2048.
-# 2048 → T ≤ 128K at kBlockM=64, T ≤ 256K at kBlockM=128.
-_BITMASK_MAX_TM = 2048
+# No longer bounded by tl.sort.  Practical limit: register pressure at very
+# large TM_PAD.  65536 tiles → T ≤ 4M at kBlockM=64, T ≤ 8M at kBlockM=128.
+_BITMASK_MAX_TM = 65536
 
 
 def mask_from_stats_fused(
@@ -156,8 +143,8 @@ def mask_from_stats_fused(
 
     Uses _fused_bitmask_kernel with grid=(BH, N).  Each CTA loops over all Tm
     Q-tiles for one KV-column, accumulates tile_mass[Tm] in registers,
-    thresholds, and packs directly into NUM_WORDS int32 words — no scratch
-    buffer, no intermediate uint8.
+    applies a sortless per-tile threshold, and packs directly into NUM_WORDS
+    int32 words — no scratch buffer, no intermediate uint8.
 
     Bit (m % 32) of word (m // 32) of bitmask[b, h, n, :] is set iff Q-block m
     should be computed for KV-block n.  The C++ backward kernel streams words
@@ -166,9 +153,6 @@ def mask_from_stats_fused(
     Returns:
         int32 bitmask of shape [B, H, N, NUM_WORDS]
         where NUM_WORDS = max(32, next_power_of_2(Tm)) // 32
-
-    Raises:
-        AssertionError if Tm > 2048 (tl.sort limit) or N > 256K (kBlockN=128).
     """
     B, H, seq_q, N = tile_lse.shape
     BH = B * H
@@ -179,16 +163,12 @@ def mask_from_stats_fused(
     assert softmax_lse.shape[:2] == (B, H), \
         f"softmax_lse batch/head {softmax_lse.shape[:2]} doesn't match tile_lse (B={B}, H={H})"
     assert Tm <= _BITMASK_MAX_TM, \
-        f"Tm={Tm} exceeds max supported ({_BITMASK_MAX_TM}); tl.sort limit is 2048 elements"
-
-    # N_PAD must be power of 2 for tl.sort; max 2048 → seq_len ≤ 256K at kBlockN=128
-    N_PAD = _next_power_of_2(N)
-    assert N_PAD <= 2048, f"N_PAD={N_PAD} too large for Triton sort (max 2048)"
+        f"Tm={Tm} exceeds max supported ({_BITMASK_MAX_TM})"
 
     stride_lse_b, stride_lse_h, stride_lse_row, stride_lse_n = tile_lse.stride()
     stride_slse_b, stride_slse_h, stride_slse_row = softmax_lse.stride()
 
-    # TM_PAD must be a multiple of 32 (word size) and a power-of-2 for tl.sort.
+    # TM_PAD must be a multiple of 32 (word size) for bitmask packing.
     TM_PAD = max(32, _next_power_of_2(Tm))
     NUM_WORDS = TM_PAD // 32
     bitmask_out = torch.empty(BH, N, NUM_WORDS, device=tile_lse.device, dtype=torch.int32)
