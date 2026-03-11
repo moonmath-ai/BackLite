@@ -513,8 +513,8 @@ struct CollectiveMainloopBwdSm90 {
             // uint32_t mask = first_word & ((2 << lane) - 1);
             uint32_t lane_mask = 0xFFFFFFFFu >> (31 - lane);
             uint32_t mask = first_word & lane_mask;
-            bool is_set = (first_word & (1u << lane)) != 0;
             int save_location = __popc(mask) - 1;
+            bool is_set = (first_word & (1u << lane)) != 0;
             if (is_set) {
                 shared_storage.compatition_m_blocks[save_location] = lane;
             }
@@ -567,7 +567,7 @@ struct CollectiveMainloopBwdSm90 {
         //     return;
         // }
 
-        if (active.has_more()) {
+        if (!active.has_more()) {
             scheduler_prefetch();
             return;
         }
