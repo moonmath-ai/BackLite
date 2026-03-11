@@ -1180,7 +1180,7 @@ struct CollectiveMainloopBwdSm90 {
             if constexpr (!Q_dO_same_stages) { ++smem_pipe_read_do; }
         };
 
-        int m_block = active.next_active();
+        // int m_block = active.next_active();
 
         // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
         // this helps quite a bit to not have to do causal masking for most of the iterations.
@@ -1191,11 +1191,13 @@ struct CollectiveMainloopBwdSm90 {
             int const m_block_end = std::min(m_block_max, m_block_masking_max);
             CUTLASS_PRAGMA_NO_UNROLL
             // while (m_block < m_block_end) {
+            int m_block = -1;
             while (active.has_more() && m_block < m_block_end) {
             // while (active.has_more()) {
-                bwd_step(m_block, mask_fn);
-                // m_block = active.next_active( m_block + 1, m_block_max);
                 m_block = active.next_active();
+                bwd_step(m_block, mask_fn);
+                // // m_block = active.next_active( m_block + 1, m_block_max);
+                // m_block = active.next_active();
             }
         }
 
@@ -1206,23 +1208,28 @@ struct CollectiveMainloopBwdSm90 {
             : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
 
         auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
+
+        int m_block = -1;
         CUTLASS_PRAGMA_NO_UNROLL
         // while (m_block < m_block_max_before_local_mask) {
         while (active.has_more() && m_block < m_block_max_before_local_mask) {
         // while (active.has_more()) {
-            bwd_step(m_block, mask_fn);
-            // m_block = active.next_active( m_block + 1, m_block_max);
             m_block = active.next_active();
+            bwd_step(m_block, mask_fn);
+            // // m_block = active.next_active( m_block + 1, m_block_max);
+            // m_block = active.next_active();
         }
 
         if constexpr (Is_local && SeparateMaskingIterations) {
             auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
             CUTLASS_PRAGMA_NO_UNROLL
+            int m_block = -1;
             while (active.has_more() && m_block < m_block_max) {
             // while (active.has_more()) {
-                bwd_step(m_block, mask_fn);
-                // m_block = active.next_active( m_block + 1, m_block_max);
                 m_block = active.next_active();
+                bwd_step(m_block, mask_fn);
+                // // m_block = active.next_active( m_block + 1, m_block_max);
+                // m_block = active.next_active();
             }
         }
 
