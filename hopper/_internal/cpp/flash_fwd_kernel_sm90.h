@@ -87,6 +87,7 @@ namespace flash
 
         static constexpr uint32_t NumLoadWarpGroups = 1;
         static constexpr uint32_t NumMmaWarpGroups = CUTE_STATIC_V(size(TiledMmaPV{})) / cutlass::NumThreadsPerWarpGroup;
+        static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
         static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMmaPV{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
         static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
         static_assert(NumMmaWarpGroups == 1 || NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
@@ -149,6 +150,9 @@ namespace flash
                 alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
                 alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
             } pipelines;
+
+            // float backlite_row_sum[2][NumMmaThreads];
+            alignas(sizeof(float4)) float backlite_stats[2 * NumMmaThreads];
         };
 
         static constexpr int SharedStorageSize = sizeof(SharedStorage);

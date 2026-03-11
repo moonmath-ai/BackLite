@@ -1579,18 +1579,45 @@ namespace flash
 
                     // Flush deferred tile_stats from PREVIOUS iteration during QK/PV overlap
                     if constexpr (SaveTileStats) {
-                        unsigned lane_d = thread_idx % 32;
-                        unsigned qmask_d = 0xFu << (lane_d & ~3u);
-                        def_d0 += __shfl_xor_sync(qmask_d, def_d0, 2);
-                        def_d1 += __shfl_xor_sync(qmask_d, def_d1, 2);
-                        def_d0 += __shfl_xor_sync(qmask_d, def_d0, 1);
-                        def_d1 += __shfl_xor_sync(qmask_d, def_d1, 1);
-                        auto def_mx = make_fragment_like(softmax.row_max);
-                        def_mx(0) = def_max0; def_mx(1) = def_max1;
-                        auto def_sm = make_fragment_like(softmax.row_sum);
-                        def_sm(0) = def_d0; def_sm(1) = def_d1;
-                        save_tile_stats_epilogue(stats_row_base, stats_stride_N, def_mx, def_sm,
-                            stats_scale_log2, def_tile_n, thread_idx);
+
+                        // TODO: make the indexing clearning and faster!
+                        int warp_id = thread_idx / 32;
+                        int lane_id = thread_idx % 32;
+                        int address = warp_id * 64;
+                        // shared_storage.backlite_stats[address + lane_id] = softmax.row_sum(0);
+                        shared_storage.backlite_stats[address + lane_id] = def_d0;
+                        // shared_storage.backlite_stats[address + lane_id + 32] = softmax.row_sum(1);
+                        shared_storage.backlite_stats[address + lane_id + 32] = def_d1;
+
+                        /*
+                        the threads for which lane_id % 2 == 0 process row 0.
+                        and the threads for which lane_id % 2 == 1 process row 1.
+                        */
+                        // consider: reading float3 (stll writing float4, this way we can do vectorized float2 and regualr float load)
+                        float4* backlite_stats_ptr = reinterpret_cast<float4*>(shared_storage.backlite_stats);
+                        float4 elements = backlite_stats_ptr[warp_id * 16 + (lane_id / 4) + (lane_id % 2) * 8];
+                        float sum_val = elements.x + elements.y + elements.z + elements.w;
+                        float log_val = __log2f(sum_val);
+                        // float max_val = lane_id % 2 == 0 ? softmax.row_max(0) : softmax.row_max(1);
+                        float max_val = lane_id % 2 == 0 ? def_max0 : def_max1;
+                        float val = max_val * stats_scale_log2 + log_val;
+                        float* addr = stats_row_base + int64_t(def_tile_n) * stats_stride_N;
+                        if (lane_id % 4 < 2) {
+                            addr[lane_id % 4] = val;
+                        }
+
+                        // unsigned lane_d = thread_idx % 32;
+                        // unsigned qmask_d = 0xFu << (lane_d & ~3u);
+                        // def_d0 += __shfl_xor_sync(qmask_d, def_d0, 2);
+                        // def_d1 += __shfl_xor_sync(qmask_d, def_d1, 2);
+                        // def_d0 += __shfl_xor_sync(qmask_d, def_d0, 1);
+                        // def_d1 += __shfl_xor_sync(qmask_d, def_d1, 1);
+                        // auto def_mx = make_fragment_like(softmax.row_max);
+                        // def_mx(0) = def_max0; def_mx(1) = def_max1;
+                        // auto def_sm = make_fragment_like(softmax.row_sum);
+                        // def_sm(0) = def_d0; def_sm(1) = def_d1;
+                        // save_tile_stats_epilogue(stats_row_base, stats_stride_N, def_mx, def_sm,
+                        //     stats_scale_log2, def_tile_n, thread_idx);
                     }
 
                     if constexpr (Is_INT8){
@@ -1610,6 +1637,13 @@ namespace flash
                         scoremod_premask_fn(tSrS_ambiguous_type);
                     }
                     mask_fn(tSrS_ambiguous_type, new_n_block);
+
+                    if constexpr (!HasQv)
+                    {
+                        warpgroup_wait<0>();
+                        pipeline_v.consumer_release(smem_pipe_read_v); // release V
+                    }
+
                     cute::copy(softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS_ambiguous_type), scores_scale);
 
                     if constexpr (LargeHeadDimV)
@@ -1627,11 +1661,11 @@ namespace flash
                     } else {
                         softmax.template online_softmax_dequantize</*Is_first=*/false, Check_inf>(tSrS_ambiguous_type, tSrS);
                     }
-                    if constexpr (!HasQv)
-                    {
-                        warpgroup_wait<0>();
-                        pipeline_v.consumer_release(smem_pipe_read_v); // release V
-                    }
+                    // if constexpr (!HasQv)
+                    // {
+                    //     warpgroup_wait<0>();
+                    //     pipeline_v.consumer_release(smem_pipe_read_v); // release V
+                    // }
                     // Defer current iteration's tile_stats to next iteration's QK overlap
                     if constexpr (SaveTileStats) {
                         def_d0 = softmax.row_sum(0) - row_sum_prev(0);
@@ -1714,18 +1748,44 @@ namespace flash
                 flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
                 // Flush last iteration's deferred tile_stats during final PV overlap
                 if constexpr (SaveTileStats) {
-                    unsigned lane_d = thread_idx % 32;
-                    unsigned qmask_d = 0xFu << (lane_d & ~3u);
-                    def_d0 += __shfl_xor_sync(qmask_d, def_d0, 2);
-                    def_d1 += __shfl_xor_sync(qmask_d, def_d1, 2);
-                    def_d0 += __shfl_xor_sync(qmask_d, def_d0, 1);
-                    def_d1 += __shfl_xor_sync(qmask_d, def_d1, 1);
-                    auto def_mx = make_fragment_like(softmax.row_max);
-                    def_mx(0) = def_max0; def_mx(1) = def_max1;
-                    auto def_sm = make_fragment_like(softmax.row_sum);
-                    def_sm(0) = def_d0; def_sm(1) = def_d1;
-                    save_tile_stats_epilogue(stats_row_base, stats_stride_N, def_mx, def_sm,
-                        stats_scale_log2, def_tile_n, thread_idx);
+                    // TODO: make the indexing clearning and faster!
+                    int warp_id = thread_idx / 32;
+                    int lane_id = thread_idx % 32;
+                    int address = warp_id * 64;
+                    // shared_storage.backlite_stats[address + lane_id] = softmax.row_sum(0);
+                    shared_storage.backlite_stats[address + lane_id] = def_d0;
+                    // shared_storage.backlite_stats[address + lane_id + 32] = softmax.row_sum(1);
+                    shared_storage.backlite_stats[address + lane_id + 32] = def_d1;
+
+                    /*
+                    the threads for which lane_id % 2 == 0 process row 0.
+                    and the threads for which lane_id % 2 == 1 process row 1.
+                    */
+                    // consider: reading float3 (stll writing float4, this way we can do vectorized float2 and regualr float load)
+                    float4* backlite_stats_ptr = reinterpret_cast<float4*>(shared_storage.backlite_stats);
+                    float4 elements = backlite_stats_ptr[warp_id * 16 + (lane_id / 4) + (lane_id % 2) * 8];
+                    float sum_val = elements.x + elements.y + elements.z + elements.w;
+                    float log_val = __log2f(sum_val);
+                    // float max_val = lane_id % 2 == 0 ? softmax.row_max(0) : softmax.row_max(1);
+                    float max_val = lane_id % 2 == 0 ? def_max0 : def_max1;
+                    float val = max_val * stats_scale_log2 + log_val;
+                    float* addr = stats_row_base + int64_t(def_tile_n) * stats_stride_N;
+                    if (lane_id % 4 < 2) {
+                        addr[lane_id % 4] = val;
+                    }
+
+                    // unsigned lane_d = thread_idx % 32;
+                    // unsigned qmask_d = 0xFu << (lane_d & ~3u);
+                    // def_d0 += __shfl_xor_sync(qmask_d, def_d0, 2);
+                    // def_d1 += __shfl_xor_sync(qmask_d, def_d1, 2);
+                    // def_d0 += __shfl_xor_sync(qmask_d, def_d0, 1);
+                    // def_d1 += __shfl_xor_sync(qmask_d, def_d1, 1);
+                    // auto def_mx = make_fragment_like(softmax.row_max);
+                    // def_mx(0) = def_max0; def_mx(1) = def_max1;
+                    // auto def_sm = make_fragment_like(softmax.row_sum);
+                    // def_sm(0) = def_d0; def_sm(1) = def_d1;
+                    // save_tile_stats_epilogue(stats_row_base, stats_stride_N, def_mx, def_sm,
+                    //     stats_scale_log2, def_tile_n, thread_idx);
                 }
                 // For INT8, V is bf16, so no v_descale needed (use Is_FP8)
                 float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
