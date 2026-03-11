@@ -2,15 +2,15 @@
 
 ### [Project Page](https://moonmath-ai.github.io/BackLite/) | [MoonMath.ai](https://moonmath.ai)
 
-**BackLite** is a lightweight [Flash Attention 3](https://github.com/Dao-AILab/flash-attention) wrapper that accelerates training via a **sparse backward pass**. By collecting per-tile LSE statistics during the forward pass, BackLite identifies attention tiles whose cumulative probability mass is negligible and skips them entirely during gradient computation.
-
+**BackLite** is a lightweight wrapper around [Flash Attention 3](https://github.com/Dao-AILab/flash-attention) which identifies and exploits the sparsity of attention matrices in order to speed up the attention backward pass, while *mathematically* approximating the attention gradients.
 
 ## 📖 Overview
 
-Attention backward passes are a dominant cost in transformer training. BackLite reduces this cost by making the backward pass **block-sparse**: tiles that contribute less than a configurable probability mass threshold (`negl_prob`) to the output are skipped when computing gradients, with no impact on the forward pass or output.
+Attention backward passes are a dominant cost in transformer training. BackLite reduces this cost by making the matrix multiplications for the backward pass **block-sparse**. The algorithm computes the forward pass exactly (similar to FA) while additionally recording the weights of the attention matrix tiles. During the backward pass, the algorithm skips the computations related to the smallest attention matrix tiles, which cumulatively weigh less than a configurable probability weight threshold (`negl_prob`). 
 
 Key properties:
-- **Accurate**: Only tiles with negligible probability mass (< `negl_prob`) are skipped — gradients for significant tiles are computed exactly.
+- **Accurate**: Smallest weighted tiles with cumulative weight < `negl_prob` are skipped.
+- **Tunable**: One can tune `negl_prob` online to target specific gradient similarity metrics (cosine similarity, relative L2 difference) between the gradients computed by FA and BackLite. (Calibration tool: coming soon!)
 - **Zero forward overhead** when `negl_prob = 0` (falls back to standard FA3).
 - **Adaptive**: Sparsity is derived from actual attention statistics per sample, per head.
 - **Composable**: Supports LSE output for combining partial attention results.
@@ -19,7 +19,7 @@ Key properties:
 
 ### Sparse Backward Masking
 
-BackLite introduces a two-phase mechanism:
+BackLite uses a two-phase mechanism:
 
 **Phase 1 — Forward pass with tile statistics**: When `negl_prob > 0`, the FA3 forward kernel records the per-tile log-sum-exp (LSE) for every `(query tile, key tile)` pair alongside the standard output and full-row LSE.
 
@@ -27,11 +27,11 @@ BackLite introduces a two-phase mechanism:
 
 $$p_\text{tile} = \exp\!\left(\mathrm{LSE}_\text{tile} - \mathrm{LSE}_\text{row}\right)$$
 
-If $p_\text{tile}$ is less than `negl_prob`, the tile is marked as skippable and the backward kernel bypasses it entirely — no memory reads, no FLOPs.
+`mask_from_stats_fused` selects the smallest weighted tiles with cumulative weight summing less than `negl_prob` and marks them as skippable. The backward kernel bypasses it entirely — no memory reads, no FLOPs.
 
 This approach:
 - Introduces **no approximation in the forward pass**
-- Introduces **negligible gradient error** for properly chosen `negl_prob` (tiles with $< 1\%$ mass contribute $< 1\%$ to the gradient)
+- Introduces **negligible gradient error** for properly chosen `negl_prob`
 - Generates the sparsity mask in a **single Triton pass** over the stored tile statistics
 
 ## 📊 Backward Sparsity
@@ -87,7 +87,7 @@ from back_lite import BackLite
 attn = BackLite()
 output = attn(query, key, value)
 
-# Sparse backward pass — skip tiles contributing < 5% probability mass
+# Sparse backward pass — skip smallest tiles cumulatively contributing < 5% probability mass
 attn = BackLite(negl_prob=0.05)
 output = attn(query, key, value)
 
@@ -97,7 +97,6 @@ output = attn(query, key, value, scale=1.0 / math.sqrt(head_dim))
 # Forward + backward example
 attn = BackLite(negl_prob=0.05)
 output = attn(query, key, value)
-loss = output.sum()
 loss.backward()  # backward uses the sparse mask generated in the forward pass
 ```
 
