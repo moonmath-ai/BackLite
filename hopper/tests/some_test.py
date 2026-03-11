@@ -46,11 +46,11 @@ D = 128
 H = 13
 NEGL_PROB = 0.3
 DEVICE = "cuda"
-WARMUP = 200
-REPEATS = 500
+# WARMUP = 200
+# REPEATS = 500
 
-# WARMUP = 0
-# REPEATS = 1
+WARMUP = 0
+REPEATS = 1
 
 torch.manual_seed(42)
 
@@ -62,9 +62,9 @@ def bench_interleaved(fn_a, fn_b, warmup=WARMUP, repeats=REPEATS):
     """
     # Warmup both equally
     for _ in range(warmup):
-        fn_b()
-        torch.cuda.synchronize()
         fn_a()
+        torch.cuda.synchronize()
+        fn_b()
         torch.cuda.synchronize()
 
     torch.cuda.synchronize()
@@ -77,9 +77,9 @@ def bench_interleaved(fn_a, fn_b, warmup=WARMUP, repeats=REPEATS):
 
     # Interleaved measurement
     for i in range(repeats):
-        starts_b[i].record(); fn_b(); ends_b[i].record()
-        torch.cuda.synchronize()
         starts_a[i].record(); fn_a(); ends_a[i].record()
+        torch.cuda.synchronize()
+        starts_b[i].record(); fn_b(); ends_b[i].record()
         torch.cuda.synchronize()
     torch.cuda.synchronize()
 
