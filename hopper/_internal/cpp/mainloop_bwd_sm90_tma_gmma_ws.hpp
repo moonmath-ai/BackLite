@@ -493,7 +493,7 @@ struct CollectiveMainloopBwdSm90 {
     CUTLASS_DEVICE static MaskBits
     get_mask_words(Params const& params, int bidb, int bidh, int n_block, SharedStorage &shared_storage) {
         if (params.ptr_block_mask == nullptr) {
-            return {nullptr, 0, 0u};
+            return {nullptr, 0, 0u, -1};
         }
         int num_heads = get<2>(params.shape_Q);
         int num_words = params.num_row_tiles;   // num_mask_words
@@ -503,14 +503,11 @@ struct CollectiveMainloopBwdSm90 {
                 + n_block * num_words;
 
         uint32_t first_word = (num_words > 0) ? __ldg(ptr) : 0u;
-        // length
         int length = __popc(first_word);
-        // int length = 32;
 
         if (threadIdx.x < 32){
             int lane = threadIdx.x % 32; // TODO: varify that the shape of the grid is flat
 
-            // uint32_t mask = first_word & ((2 << lane) - 1);
             uint32_t lane_mask = 0xFFFFFFFFu >> (31 - lane);
             uint32_t mask = first_word & lane_mask;
             int save_location = __popc(mask) - 1;
@@ -526,8 +523,7 @@ struct CollectiveMainloopBwdSm90 {
         }
 
         // return {ptr, num_words};
-        return {shared_storage.compatition_m_blocks, length, first_word};
-        // return {shared_storage.compatition_m_blocks, length, ~(0u), 0};
+        return {shared_storage.compatition_m_blocks, length, first_word, -1};
     }
 
     template <typename SchedulerPrefetch, typename SharedStorage>
@@ -778,11 +774,21 @@ struct CollectiveMainloopBwdSm90 {
         if constexpr (!Deterministic) {
             CUTLASS_PRAGMA_NO_UNROLL
             do{
+                int warpgroup_idx = 0;
+                cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);  // sdQ full, to be written to gmem
+
+                int m_block = active.next_active();
+
+                if (lane_predicate) {
+                    SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                    tma_store_arrive();
+                }
+
                 #pragma unroll
-                for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
+                for (warpgroup_idx = 1; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
                     cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);  // sdQ full, to be written to gmem
 
-                    int m_block = active.next_active();
+                    // int m_block = active.next_active();
 
                     if (lane_predicate) {
                         SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
@@ -1186,6 +1192,7 @@ struct CollectiveMainloopBwdSm90 {
             CUTLASS_PRAGMA_NO_UNROLL
             // while (m_block < m_block_end) {
             while (active.has_more() && m_block < m_block_end) {
+            // while (active.has_more()) {
                 bwd_step(m_block, mask_fn);
                 // m_block = active.next_active( m_block + 1, m_block_max);
                 m_block = active.next_active();
@@ -1202,6 +1209,7 @@ struct CollectiveMainloopBwdSm90 {
         CUTLASS_PRAGMA_NO_UNROLL
         // while (m_block < m_block_max_before_local_mask) {
         while (active.has_more() && m_block < m_block_max_before_local_mask) {
+        // while (active.has_more()) {
             bwd_step(m_block, mask_fn);
             // m_block = active.next_active( m_block + 1, m_block_max);
             m_block = active.next_active();
@@ -1211,6 +1219,7 @@ struct CollectiveMainloopBwdSm90 {
             auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
             CUTLASS_PRAGMA_NO_UNROLL
             while (active.has_more() && m_block < m_block_max) {
+            // while (active.has_more()) {
                 bwd_step(m_block, mask_fn);
                 // m_block = active.next_active( m_block + 1, m_block_max);
                 m_block = active.next_active();
