@@ -729,31 +729,32 @@ struct CollectiveMainloopBwdSm90 {
                 m_block = active.next_active( m_block + 1, m_block_max);
             }
             return;
-        }
-        // Deterministic: iterate ALL m-blocks for barrier ordering, check mask per tile
-        #pragma unroll 2
-        for (int m_blk = m_block_min; m_blk < m_block_max; ++m_blk) {
-            bool const is_block_active = active.is_active(m_blk);
-            if constexpr (Deterministic) {
-                Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_blk * num_batch * num_head, n_block);
-            }
-            if (is_block_active) {
-                #pragma unroll
-                for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
-                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);
-                    if (lane_predicate) {
-                        SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_blk).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
-                        tma_store_arrive();
-                    }
+        }else{
+            // Deterministic: iterate ALL m-blocks for barrier ordering, check mask per tile
+            #pragma unroll 2
+            for (int m_blk = m_block_min; m_blk < m_block_max; ++m_blk) {
+                bool const is_block_active = active.is_active(m_blk);
+                if constexpr (Deterministic) {
+                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_blk * num_batch * num_head, n_block);
                 }
-                // Note, the for_each() function is required here to ensure `warpgroup_idx` is of type Int<x>.
-                for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto warpgroup_idx) {
-                    if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(warpgroup_idx)>(); }
-                    cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);
-                });
-            }
-            if constexpr (Deterministic) {
-                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_blk * num_batch * num_head);
+                if (is_block_active) {
+                    #pragma unroll
+                    for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
+                        cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);
+                        if (lane_predicate) {
+                            SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_blk).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                            tma_store_arrive();
+                        }
+                    }
+                    // Note, the for_each() function is required here to ensure `warpgroup_idx` is of type Int<x>.
+                    for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto warpgroup_idx) {
+                        if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(warpgroup_idx)>(); }
+                        cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);
+                    });
+                }
+                if constexpr (Deterministic) {
+                    Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_blk * num_batch * num_head);
+                }
             }
         }
         if constexpr (Is_local && Deterministic) {
