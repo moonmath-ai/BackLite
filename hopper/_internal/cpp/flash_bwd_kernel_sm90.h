@@ -84,6 +84,8 @@ public:
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
 
+        int compatition_m_blocks[32];
+
     };
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
