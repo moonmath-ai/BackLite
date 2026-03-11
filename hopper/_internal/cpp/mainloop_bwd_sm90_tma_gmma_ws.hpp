@@ -438,10 +438,10 @@ struct CollectiveMainloopBwdSm90 {
     // allocation, scales to arbitrary Tm.  L2 latency is hidden by the TMA
     // pipeline stalls surrounding each bwd_step call.
     struct MaskBits {
-        uint32_t const* ptr;  // nullptr = all active (no mask)
-        int length;        // number of uint32 words; 0 when ptr == nullptr
-        int word;
-        int curr_idx;
+        int const* ptr;  // nullptr = all active (no mask); points to list of active m_block indices
+        const int length;        // number of active m_blocks; 0 when ptr == nullptr
+        const uint32_t word;
+        mutable int curr_idx;
 
         CUTLASS_DEVICE bool has_more() const {
             return curr_idx < length;
@@ -487,10 +487,11 @@ struct CollectiveMainloopBwdSm90 {
 
     // Build a MaskBits for (bidb, bidh, n_block): stores pointer + word count.
     // No data loaded at startup — words are fetched lazily in next_active.
+    template <typename SharedStorage>
     CUTLASS_DEVICE static MaskBits
     get_mask_words(Params const& params, int bidb, int bidh, int n_block, SharedStorage &shared_storage) {
         if (params.ptr_block_mask == nullptr) {
-            return {nullptr, 0};
+            return {nullptr, 0, 0u, 0};
         }
         int num_heads = get<2>(params.shape_Q);
         int num_words = params.num_row_tiles;   // num_mask_words
@@ -544,7 +545,7 @@ struct CollectiveMainloopBwdSm90 {
                 return;
             }
         }
-        MaskBits active = get_mask_words(params, bidb, bidh, n_block);
+        MaskBits active = get_mask_words(params, bidb, bidh, n_block, shared_storage);
         // TODO: add a sync or a fance for shared memory
         __threadfence_block();
 
@@ -721,7 +722,7 @@ struct CollectiveMainloopBwdSm90 {
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return; }
         }
-        MaskBits active = get_mask_words(params, bidb, bidh, n_block);
+        MaskBits active = get_mask_words(params, bidb, bidh, n_block, shared_storage);
         // int m_block = active.next_active( m_block_min, m_block_max);
         int m_block = active.next_active();
 
@@ -970,7 +971,7 @@ struct CollectiveMainloopBwdSm90 {
         );
 
         // Block sparsity — byte-pointer for next-active-m scanning
-        MaskBits active = get_mask_words(params, bidb, bidh, n_block);
+        MaskBits active = get_mask_words(params, bidb, bidh, n_block, shared_storage);
         // int m_block = active.next_active( m_block_min, m_block_max);
         // if (m_block >= m_block_max) { return false; }
         if (!active.has_more()) { return false; }
