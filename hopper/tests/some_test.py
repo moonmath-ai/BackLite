@@ -46,25 +46,35 @@ D = 128
 H = 13
 NEGL_PROB = 0.3
 DEVICE = "cuda"
-# WARMUP = 200
-# REPEATS = 500
+WARMUP = 100
+REPEATS = 1000
 
-WARMUP = 0
-REPEATS = 1
+# WARMUP = 0
+# REPEATS = 1
 
 torch.manual_seed(42)
 
+def get_inputs(B, T, H, D):
+    q = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    k = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    v = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+    dout = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE)
+    return q, k, v, dout
 
-def bench_interleaved(fn_a, fn_b, warmup=WARMUP, repeats=REPEATS):
+
+def bench_interleaved(fn_a, fn_b, B, T, H, D, warmup=WARMUP, repeats=REPEATS):
     """
     Interleaved benchmark: alternate A and B every iteration.
     Returns (p50_a, p10_a, p50_b, p10_b) in ms.
     """
+
+    q, k, v, dout = get_inputs(B, T, H, D)
+
     # Warmup both equally
     for _ in range(warmup):
-        fn_a()
+        fn_a(q, k, v, dout)
         torch.cuda.synchronize()
-        fn_b()
+        fn_b(q, k, v, dout)
         torch.cuda.synchronize()
 
     torch.cuda.synchronize()
@@ -77,9 +87,10 @@ def bench_interleaved(fn_a, fn_b, warmup=WARMUP, repeats=REPEATS):
 
     # Interleaved measurement
     for i in range(repeats):
-        starts_a[i].record(); fn_a(); ends_a[i].record()
+        q, k, v, dout = get_inputs(B, T, H, D)
+        starts_a[i].record(); fn_a(q, k, v, dout); ends_a[i].record()
         torch.cuda.synchronize()
-        starts_b[i].record(); fn_b(); ends_b[i].record()
+        starts_b[i].record(); fn_b(q, k, v, dout); ends_b[i].record()
         torch.cuda.synchronize()
     torch.cuda.synchronize()
 
@@ -108,15 +119,15 @@ for causal, window_size, label in [
     # for B, T in [(16, 2048), (16, 4096), (16, 8192), (16, 4096), (16, 8192)]:
     # for B, T in [(4, 2048), (2, 4096), (1, 8192), (4, 4096), (2, 8192)]:
     for B, T in [(16, 2048)]:
-        q = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
-        k = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
-        v = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
-        dout = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE)
+        # q = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        # k = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        # v = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
+        # dout = torch.randn(B, T, H, D, device=DEVICE, dtype=DTYPE)
 
-        def zero_grads():
+        def zero_grads(q, k, v, dout):
             q.grad = None; k.grad = None; v.grad = None
 
-        def vanilla():
+        def vanilla(q, k, v, dout):
             # Grad zeroing is OUTSIDE the event window in the interleaved loop.
             # But autograd accumulates, so we must zero here too; cost is equal
             # for both branches so it cancels out in the speedup ratio.
@@ -124,11 +135,11 @@ for causal, window_size, label in [
             o = fa3_flash_attn_func(q, k, v, causal=causal, window_size=window_size)
             o.backward(dout)
 
-        def backlite():
+        def backlite(q, k, v, dout):
             q.grad = None; k.grad = None; v.grad = None
             o = backlite_flash_attn_func(q, k, v, causal=causal, window_size=window_size, negl_prob=NEGL_PROB)
             o.backward(dout)
 
-        p50_v, p10_v, p50_b, p10_b = bench_interleaved(vanilla, backlite)
+        p50_v, p10_v, p50_b, p10_b = bench_interleaved(vanilla, backlite, B, T, H, D)
         speedup = (p50_v / p50_b - 1) * 100
         print(f"{B:>4}  {T:>5}  {p50_v:>10.3f}  {p50_b:>10.3f}  {speedup:>+7.1f}%  {p10_v:>9.3f}  {p10_b:>8.3f}")
