@@ -84,7 +84,7 @@ public:
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
 
-        int compatition_m_blocks[32];
+        alignas(16) int compatition_m_blocks[32];
 
     };
 

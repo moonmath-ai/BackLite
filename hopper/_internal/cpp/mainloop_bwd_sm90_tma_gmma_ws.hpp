@@ -441,21 +441,23 @@ struct CollectiveMainloopBwdSm90 {
         int const* ptr;  // nullptr = all active (no mask); points to list of active m_block indices
         const int length;        // number of active m_blocks; 0 when ptr == nullptr
         const uint32_t word;
-        mutable int curr_idx;
+        mutable int curr_idx = -1;
 
         CUTLASS_DEVICE bool has_more() const {
-            return curr_idx < length;
+            // return (curr_idx + 1 < length) && (ptr != nullptr);
+            return (curr_idx + 1 < length);
         }
 
         CUTLASS_DEVICE int next_active() const {
-            int m_block = ptr[curr_idx];
+            // if (ptr == nullptr) return -1;
             curr_idx++;
+            int m_block = ptr[curr_idx];
             return m_block;
         }
 
         // True iff Q-block m is active.
         CUTLASS_DEVICE bool is_active(int m) const {
-            return (word & (1 << (m % 32))) != 0;
+            return (word & (1u << (m % 32))) != 0;
         }
 
         // // True iff Q-block m is active.
@@ -491,7 +493,7 @@ struct CollectiveMainloopBwdSm90 {
     CUTLASS_DEVICE static MaskBits
     get_mask_words(Params const& params, int bidb, int bidh, int n_block, SharedStorage &shared_storage) {
         if (params.ptr_block_mask == nullptr) {
-            return {nullptr, 0, 0u, 0};
+            return {nullptr, 0, 0u};
         }
         int num_heads = get<2>(params.shape_Q);
         int num_words = params.num_row_tiles;   // num_mask_words
@@ -503,19 +505,29 @@ struct CollectiveMainloopBwdSm90 {
         uint32_t first_word = (num_words > 0) ? __ldg(ptr) : 0u;
         // length
         int length = __popc(first_word);
+        // int length = 32;
 
         if (threadIdx.x < 32){
             int lane = threadIdx.x % 32; // TODO: varify that the shape of the grid is flat
-            uint32_t mask = first_word & ((2 << lane) - 1);
-            bool is_set = (first_word & (1 << lane)) != 0;
-            int save_location = __popc(mask);
+
+            // uint32_t mask = first_word & ((2 << lane) - 1);
+            uint32_t lane_mask = 0xFFFFFFFFu >> (31 - lane);
+            uint32_t mask = first_word & lane_mask;
+            bool is_set = (first_word & (1u << lane)) != 0;
+            int save_location = __popc(mask) - 1;
             if (is_set) {
                 shared_storage.compatition_m_blocks[save_location] = lane;
             }
+
+            // if (cute::thread0()) {
+            //     printf("first_word: %d, save_location: %d, lane: %d, is_set: %d\n", first_word, save_location, lane, is_set);
+            // }
+            // shared_storage.compatition_m_blocks[lane] = lane;
         }
 
         // return {ptr, num_words};
-        return {shared_storage.compatition_m_blocks, length, first_word, 0};
+        return {shared_storage.compatition_m_blocks, length, first_word};
+        // return {shared_storage.compatition_m_blocks, length, ~(0u), 0};
     }
 
     template <typename SchedulerPrefetch, typename SharedStorage>
@@ -724,7 +736,8 @@ struct CollectiveMainloopBwdSm90 {
         }
         MaskBits active = get_mask_words(params, bidb, bidh, n_block, shared_storage);
         // int m_block = active.next_active( m_block_min, m_block_max);
-        int m_block = active.next_active();
+        // int m_block = active.next_active();
+        // int m_block = active.has_more() ? active.next_active() : m_block_max;
 
         Tensor sdQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_dqacc.data()), SmemLayoutdQaccum{});
         static constexpr int dQ_TMA_num_bytes = CUTE_STATIC_V(size<0>(sdQ)) * sizeof(ElementAccum);
@@ -742,13 +755,12 @@ struct CollectiveMainloopBwdSm90 {
         bool const lane_predicate = cute::elect_one_sync();
 
         // last do tile
-        if (m_block >= m_block_max) {
-        // if (!active.has_more()) {
+        // if (m_block >= m_block_max) {
+        if (!active.has_more()) {
             // No active tiles — handle deterministic barriers if needed
             if constexpr (Deterministic) {
                 #pragma unroll 2
                 for (int m = m_block_min; m < m_block_max; ++m) {
-                // for (int m = m_block_min; m < m_block; ++m) {
                     Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m * num_batch * num_head, n_block);
                     Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m * num_batch * num_head);
                 }
@@ -756,8 +768,7 @@ struct CollectiveMainloopBwdSm90 {
                     constexpr int kBlockM = get<0>(TileShape_MNK{});
                     int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
                     #pragma unroll 2
-                    // for (int m = m_block_max; m < m_block_global_max; ++m) {
-                    for (int m = m_block; m < m_block_global_max; ++m) {
+                    for (int m = m_block_max; m < m_block_global_max; ++m) {
                         Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m * num_batch * num_head);
                     }
                 }
@@ -766,11 +777,13 @@ struct CollectiveMainloopBwdSm90 {
         }
         if constexpr (!Deterministic) {
             CUTLASS_PRAGMA_NO_UNROLL
-            // while (m_block < m_block_max) {
-            while (active.has_more()) {
+            do{
                 #pragma unroll
                 for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
                     cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);  // sdQ full, to be written to gmem
+
+                    int m_block = active.next_active();
+
                     if (lane_predicate) {
                         SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
                         tma_store_arrive();
@@ -781,9 +794,7 @@ struct CollectiveMainloopBwdSm90 {
                     if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(warpgroup_idx)>(); }
                     cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);  // sdQ empty, ready to be written to
                 });
-                // m_block = active.next_active( m_block + 1, m_block_max);
-                m_block = active.next_active();
-            }
+            }while(active.has_more());
             return;
         }else{
             // Deterministic: iterate ALL m-blocks for barrier ordering, check mask per tile
@@ -975,7 +986,7 @@ struct CollectiveMainloopBwdSm90 {
         // int m_block = active.next_active( m_block_min, m_block_max);
         // if (m_block >= m_block_max) { return false; }
         if (!active.has_more()) { return false; }
-        int m_block = active.next_active();
+        // int m_block = active.next_active();
 
 
         clear(tdKrdK);
@@ -1162,6 +1173,8 @@ struct CollectiveMainloopBwdSm90 {
             ++smem_pipe_read;
             if constexpr (!Q_dO_same_stages) { ++smem_pipe_read_do; }
         };
+
+        int m_block = active.next_active();
 
         // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
         // this helps quite a bit to not have to do causal masking for most of the iterations.
