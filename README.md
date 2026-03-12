@@ -1,8 +1,6 @@
 # BackLite
 
-### [Project Page](https://moonmath-ai.github.io/BackLite/) | [MoonMath.ai](https://moonmath.ai)
-
-**BackLite** is a lightweight wrapper around [Flash Attention 3](https://github.com/Dao-AILab/flash-attention) which identifies and exploits the sparsity of attention matrices in order to speed up the attention backward pass, while *mathematically* approximating the attention gradients.
+**BackLite** is a lightweight wrapper around [Flash Attention 3](https://github.com/Dao-AILab/flash-attention) which identifies and exploits the sparsity of attention matrices in order to speed up the attention backward pass, while *mathematically* approximating the attention gradients. See [here](https://moonmath.ai/posts/introducing-backlite/) for more technical details.
 
 ## 📖 Overview
 
