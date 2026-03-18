@@ -518,14 +518,37 @@ struct CollectiveMainloopBwdSm90 {
         }
     };
 
+    // For local window with relative bitmask: compute the forward kernel's n_block_min
+    // for a given m_block. This matches block.h get_n_block_min_max Is_local branch.
+    CUTLASS_DEVICE static int
+    get_n_block_min_fwd(int m_block, int seqlen_q, int seqlen_k, int window_size_left) {
+        int n_idx_left = m_block * kBlockM + seqlen_k - seqlen_q - window_size_left;
+        return max(0, n_idx_left / kBlockN);
+    }
+
     CUTLASS_DEVICE static bool
     is_mask_block_active(Params const& params, int bidb, int bidh, int n_block, int m_block) {
-        uint32_t const* ptr = get_mask_ptr(params, bidb, bidh, n_block);
-        if (ptr == nullptr) { return true; }
-        int const word_idx = m_block >> 5;
-        if (word_idx < 0 || word_idx >= params.num_row_tiles) { return false; }
-        uint32_t const word = __ldg(ptr + word_idx);
-        return ((word >> (m_block & 31)) & 1u) != 0;
+        if constexpr (Is_local) {
+            // Relative bitmask: N dimension is N_local, indexed by relative offset r.
+            int const seqlen_q = get<0>(params.shape_Q);
+            int const seqlen_k = size<0>(params.shape_K);
+            int const n_min_fwd = get_n_block_min_fwd(m_block, seqlen_q, seqlen_k, params.window_size_left);
+            int const r = n_block - n_min_fwd;
+            if (r < 0 || r >= params.num_col_tiles) { return true; }  // outside bitmask range → assume active
+            uint32_t const* ptr = get_mask_ptr(params, bidb, bidh, r);
+            if (ptr == nullptr) { return true; }
+            int const word_idx = m_block >> 5;
+            if (word_idx < 0 || word_idx >= params.num_row_tiles) { return false; }
+            uint32_t const word = __ldg(ptr + word_idx);
+            return ((word >> (m_block & 31)) & 1u) != 0;
+        } else {
+            uint32_t const* ptr = get_mask_ptr(params, bidb, bidh, n_block);
+            if (ptr == nullptr) { return true; }
+            int const word_idx = m_block >> 5;
+            if (word_idx < 0 || word_idx >= params.num_row_tiles) { return false; }
+            uint32_t const word = __ldg(ptr + word_idx);
+            return ((word >> (m_block & 31)) & 1u) != 0;
+        }
     }
 
     template <typename SchedulerPrefetch, typename SharedStorage>
@@ -636,64 +659,142 @@ struct CollectiveMainloopBwdSm90 {
 
         if (lane_predicate) {
             if (use_sparse_streaming) {
-                SparseWordIterator active(get_mask_ptr(params, bidb, bidh, n_block), params.num_row_tiles, m_block_min, m_block_max);
-                if (!active.has_more()) {
-                    PipelineState q_terminal_state = smem_pipe_write;
-                    pipeline_q.producer_acquire(q_terminal_state);
-                    // Publish a metadata-only terminal stage so consumers can exit without
-                    // rebuilding sparse iteration or reading the mask from gmem.
-                    complete_empty_q_stage(q_terminal_state);
-                    ++smem_pipe_write;
+                if constexpr (Is_local) {
+                    // For local window: bitmask has relative N indexing.
+                    // Different m_blocks map to different relative offsets, so we can't use
+                    // SparseWordIterator (which pre-loads one bitmask column). Instead, iterate
+                    // over [m_block_min, m_block_max) and check each m_block individually.
+                    // The pattern mirrors the SparseWordIterator path:
+                    //   1. Load Q/LSE for first active m_block, plus K/V
+                    //   2. For each subsequent active m_block: load dO for prev, then Q/LSE for current
+                    //   3. Load dO for last active m_block, then emit terminal stages
+                    int prev_active_m = -1;
+                    bool found_any = false;
+                    for (int m_blk = m_block_min; m_blk < m_block_max; ++m_blk) {
+                        if (!is_mask_block_active(params, bidb, bidh, n_block, m_blk)) { continue; }
+                        if (!found_any) {
+                            // First active m_block: load Q/LSE + K/V
+                            pipeline_q.producer_acquire(smem_pipe_write);
+                            shared_storage.q_tile_id[smem_pipe_write.index()] = m_blk;
+                            copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                                 tQgQ(_, m_blk), tQsQ(_, smem_pipe_write.index()));
+                            copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
+                                 gLSE(_, m_blk), sLSE(_, smem_pipe_write.index()));
 
-                    PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(q_terminal_state, smem_pipe_write_do);
-                    pipeline_do.producer_acquire(smem_pipe_write_do_cur);
-                    complete_empty_do_stage(smem_pipe_write_do_cur);
-                    if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
-                } else {
-                    int m_block = active.next_active();
-                    pipeline_q.producer_acquire(smem_pipe_write);
-                    shared_storage.q_tile_id[smem_pipe_write.index()] = m_block;
-                    copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
-                         tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
-                    copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
-                         gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
+                            shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
+                            copy(params.tma_load_K.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0), tKgK, tKsK);
+                            copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0), tVgV, tVsV);
+                            found_any = true;
+                        } else {
+                            // Subsequent active m_block: load dO for prev_active_m, then Q for current
+                            PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
+                            pipeline_do.producer_acquire(smem_pipe_write_do_cur);
+                            copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                                 tdOgdO(_, prev_active_m), tdOsdO(_, smem_pipe_write_do_cur.index()));
+                            copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
+                                 gdPsum(_, prev_active_m), sdPsum(_, smem_pipe_write_do_cur.index()));
+                            if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
+                            ++smem_pipe_write;
 
-                    shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
-                    copy(params.tma_load_K.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tKgK, tKsK);
-                    copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tVgV, tVsV);
-
-                    while (true) {
+                            pipeline_q.producer_acquire(smem_pipe_write);
+                            shared_storage.q_tile_id[smem_pipe_write.index()] = m_blk;
+                            copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                                 tQgQ(_, m_blk), tQsQ(_, smem_pipe_write.index()));
+                            copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
+                                 gLSE(_, m_blk), sLSE(_, smem_pipe_write.index()));
+                        }
+                        prev_active_m = m_blk;
+                    }
+                    if (!found_any) {
+                        // No active blocks — emit terminal stage
+                        PipelineState q_terminal_state = smem_pipe_write;
+                        pipeline_q.producer_acquire(q_terminal_state);
+                        complete_empty_q_stage(q_terminal_state);
+                        ++smem_pipe_write;
+                        PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(q_terminal_state, smem_pipe_write_do);
+                        pipeline_do.producer_acquire(smem_pipe_write_do_cur);
+                        complete_empty_do_stage(smem_pipe_write_do_cur);
+                        if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
+                    } else {
+                        // Emit dO for last active m_block, then terminal stages
                         PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
                         pipeline_do.producer_acquire(smem_pipe_write_do_cur);
                         copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
-                             tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
+                             tdOgdO(_, prev_active_m), tdOsdO(_, smem_pipe_write_do_cur.index()));
                         copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
-                             gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
+                             gdPsum(_, prev_active_m), sdPsum(_, smem_pipe_write_do_cur.index()));
                         if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
-
                         ++smem_pipe_write;
-                        if (!active.has_more()) { break; }
-                        m_block = active.next_active();
 
+                        PipelineState q_terminal_state = smem_pipe_write;
+                        pipeline_q.producer_acquire(q_terminal_state);
+                        complete_empty_q_stage(q_terminal_state);
+                        ++smem_pipe_write;
+                        PipelineState_dO smem_pipe_write_do_term = cute::conditional_return<Q_dO_same_stages>(q_terminal_state, smem_pipe_write_do);
+                        pipeline_do.producer_acquire(smem_pipe_write_do_term);
+                        complete_empty_do_stage(smem_pipe_write_do_term);
+                        if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
+                    }
+                } else {
+                    SparseWordIterator active(get_mask_ptr(params, bidb, bidh, n_block), params.num_row_tiles, m_block_min, m_block_max);
+                    if (!active.has_more()) {
+                        PipelineState q_terminal_state = smem_pipe_write;
+                        pipeline_q.producer_acquire(q_terminal_state);
+                        // Publish a metadata-only terminal stage so consumers can exit without
+                        // rebuilding sparse iteration or reading the mask from gmem.
+                        complete_empty_q_stage(q_terminal_state);
+                        ++smem_pipe_write;
+
+                        PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(q_terminal_state, smem_pipe_write_do);
+                        pipeline_do.producer_acquire(smem_pipe_write_do_cur);
+                        complete_empty_do_stage(smem_pipe_write_do_cur);
+                        if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
+                    } else {
+                        int m_block = active.next_active();
                         pipeline_q.producer_acquire(smem_pipe_write);
                         shared_storage.q_tile_id[smem_pipe_write.index()] = m_block;
                         copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
-                             tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
+                            tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
                         copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
-                             gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
+                            gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
+
+                        shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
+                        copy(params.tma_load_K.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tKgK, tKsK);
+                        copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tVgV, tVsV);
+
+                        while (true) {
+                            PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
+                            pipeline_do.producer_acquire(smem_pipe_write_do_cur);
+                            copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                                tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
+                            copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
+                                gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
+                            if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
+
+                            ++smem_pipe_write;
+                            if (!active.has_more()) { break; }
+                            m_block = active.next_active();
+
+                            pipeline_q.producer_acquire(smem_pipe_write);
+                            shared_storage.q_tile_id[smem_pipe_write.index()] = m_block;
+                            copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                                tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
+                            copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
+                                gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
+                        }
+
+                        PipelineState q_terminal_state = smem_pipe_write;
+                        pipeline_q.producer_acquire(q_terminal_state);
+                        // Mirror the terminal record on both Q/LSE and dO/dPsum pipelines so
+                        // mma() can terminate from stage metadata alone.
+                        complete_empty_q_stage(q_terminal_state);
+                        ++smem_pipe_write;
+
+                        PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(q_terminal_state, smem_pipe_write_do);
+                        pipeline_do.producer_acquire(smem_pipe_write_do_cur);
+                        complete_empty_do_stage(smem_pipe_write_do_cur);
+                        if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
                     }
-
-                    PipelineState q_terminal_state = smem_pipe_write;
-                    pipeline_q.producer_acquire(q_terminal_state);
-                    // Mirror the terminal record on both Q/LSE and dO/dPsum pipelines so
-                    // mma() can terminate from stage metadata alone.
-                    complete_empty_q_stage(q_terminal_state);
-                    ++smem_pipe_write;
-
-                    PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(q_terminal_state, smem_pipe_write_do);
-                    pipeline_do.producer_acquire(smem_pipe_write_do_cur);
-                    complete_empty_do_stage(smem_pipe_write_do_cur);
-                    if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
                 }
             } else {
                 int m_block = m_block_min;

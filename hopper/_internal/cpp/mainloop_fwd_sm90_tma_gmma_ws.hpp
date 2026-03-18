@@ -1230,7 +1230,11 @@ namespace flash
             float* __restrict__ stats_row_base = nullptr;
             int64_t stats_stride_N = 0;
             float stats_scale_log2 = 0.f;
+            // For local window: tile_stats N dimension is reduced to N_local.
+            // Write at relative offset (n_block - n_block_min) instead of absolute n_block.
+            int n_block_min_stats = 0;
             if constexpr (SaveTileStats) {
+                if constexpr (Is_local) { n_block_min_stats = n_block_min; }
                 static constexpr int kMmaThreadsPerRow_s = size<0, 0>(typename TiledMmaQK::AtomLayoutC_TV{});
                 int const wg_idx     = thread_idx / 128;
                 int const warp_in_wg = (thread_idx % 128) / 32;
@@ -1520,7 +1524,7 @@ namespace flash
                     def_d1 = softmax.row_sum(1);
                     def_max0 = softmax.row_max(0);
                     def_max1 = softmax.row_max(1);
-                    def_tile_n = n_block;
+                    def_tile_n = n_block - n_block_min_stats;
                 }
                 if constexpr (Is_FP8 && !V_colmajor)
                 {
@@ -1672,7 +1676,7 @@ namespace flash
                         def_d1 = softmax.row_sum(1) - row_sum_prev(1);
                         def_max0 = softmax.row_max(0);
                         def_max1 = softmax.row_max(1);
-                        def_tile_n = new_n_block;
+                        def_tile_n = new_n_block - n_block_min_stats;
                     }
                     if constexpr (Is_FP8 && !V_colmajor)
                     {
@@ -1944,7 +1948,7 @@ namespace flash
                         row_sum_ar(0) = d0_;
                         row_sum_ar(1) = d1_;
                         save_tile_stats_epilogue(stats_row_base, stats_stride_N, softmax.row_max, row_sum_ar,
-                            stats_scale_log2, new_n_block, thread_idx);
+                            stats_scale_log2, new_n_block - n_block_min_stats, thread_idx);
                     }
 
                     warpgroup_wait<0>();

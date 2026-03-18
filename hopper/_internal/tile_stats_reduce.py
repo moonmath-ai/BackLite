@@ -4,6 +4,10 @@ Fused Triton kernel for mask generation from per-block LSE statistics.
 tile_lse contains per-block log-sum-exp in log2 domain:
     tile_lse[b, h, row, n] = log2(sum_i exp(score_i))  for KV block n
 
+For full attention:  n is a logical KV-block index.
+For local window:    n is a RELATIVE KV-block offset (same indexing the backward kernel uses).
+                     Out-of-window positions are pre-filled with -inf by the forward kernel.
+
 softmax_lse is the full-row log-sum-exp in natural log (ln) domain:
     softmax_lse[b, h, row] = ln(sum_i exp(score_i))  for all KV blocks
 
@@ -14,6 +18,10 @@ Pipeline:
 Grid = (BH, N): one CTA per (batch-head, KV-block).  Each CTA loops over all
 Tm Q-tiles, accumulates tile_mass[Tm] in registers, normalizes + sorts +
 thresholds, then packs into NUM_WORDS int32 words — no scratch buffer.
+
+The output N dimension matches the input N dimension of tile_lse exactly.
+For local window attention the backward C++ kernel indexes the bitmask with
+a relative offset (r = n_block - n_block_min_fwd) which matches tile_lse's N.
 """
 
 import torch
@@ -34,8 +42,9 @@ def _next_power_of_2(n: int) -> int:
 # ══════════════════════════════════════════════════════════════════════════
 # Fused bitmask kernel — grid=(BH, N), emits int32[BH, N, NUM_WORDS]
 #
-# For each KV-block n, loops over Tm Q-tiles → computes tile_mass[Tm] in
-# registers → normalizes + sorts + thresholds → packs into NUM_WORDS int32 words.
+# For each KV-block n (relative or absolute), loops over Tm Q-tiles →
+# computes tile_mass[Tm] in registers → normalizes + sorts + thresholds
+# → packs into NUM_WORDS int32 words.
 # ══════════════════════════════════════════════════════════════════════════
 @triton.jit
 def _fused_bitmask_kernel(
@@ -64,13 +73,14 @@ def _fused_bitmask_kernel(
     Bit (m % 32) of word (m // 32) is set iff Q-block m is active for this KV-block.
     """
     pid_bh = tl.program_id(0)
-    pid_n  = tl.program_id(1)   # KV-block column index
+    pid_n  = tl.program_id(1)   # KV-block column index (relative for local, absolute for full)
 
     b = pid_bh // H
     h = pid_bh % H
 
-    lse_base  = b * stride_lse_b  + h * stride_lse_h
-    slse_base = b * stride_slse_b + h * stride_slse_h
+    # Cast to int64 to avoid int32 overflow for large tensors (e.g. B*H*seq_q*N > 2^31 elements).
+    lse_base  = b.to(tl.int64) * stride_lse_b  + h.to(tl.int64) * stride_lse_h
+    slse_base = b.to(tl.int64) * stride_slse_b + h.to(tl.int64) * stride_slse_h
 
     LOG2E_C: tl.constexpr = 1.4426950408889634
 
@@ -86,7 +96,8 @@ def _fused_bitmask_kernel(
         valid_r   = row_offs < seq_q
         safe_rows = tl.minimum(row_offs, seq_q - 1)
 
-        # Load tile_lse[bh, row, n] — stride_row=1, so consecutive rows coalesce
+        # Load tile_lse[bh, row, n] — stride_row=1, so consecutive rows coalesce.
+        # -inf for out-of-window positions (pre-filled by forward kernel) → 0 mass.
         lse  = tl.load(tile_lse_ptr  + lse_base  + safe_rows * stride_lse_row + pid_n * stride_lse_n,
                        mask=valid_r, other=float('-inf'))
         slse = tl.load(softmax_lse_ptr + slse_base + safe_rows * stride_slse_row,
@@ -135,7 +146,7 @@ def _fused_bitmask_kernel(
     bitmask_words = tl.sum(bits_2d, axis=1)   # [NUM_WORDS]
 
     w_offs = tl.arange(0, NUM_WORDS)
-    tl.store(bitmask_ptr + (pid_bh * N_ACTUAL + pid_n) * NUM_WORDS + w_offs, bitmask_words)
+    tl.store(bitmask_ptr + (pid_bh.to(tl.int64) * N_ACTUAL + pid_n) * NUM_WORDS + w_offs, bitmask_words)
 
 
 # Max Tm supported by the bitmask kernel.
@@ -145,30 +156,27 @@ _BITMASK_MAX_TM = 2048
 
 
 def mask_from_stats_fused(
-    tile_lse: torch.Tensor,      # [B, H, seq_q, N] float32 — per-row cumulative LSE (log2 domain)
-    softmax_lse: torch.Tensor,   # [B, H, seq_q] float32 — full-row LSE (ln domain)
-    num_row_tiles_bwd: int,      # Tm = number of backward m-tiles
-    kBlockM_bwd: int,            # rows per backward tile
+    tile_lse: torch.Tensor,    # [B, H, seq_q, N] float32 — per-block LSE (log2 domain)
+    softmax_lse: torch.Tensor, # [B, H, seq_q] float32 — full-row LSE (ln domain)
+    num_row_tiles_bwd: int,    # Tm = number of backward Q-tiles
+    kBlockM_bwd: int,          # rows per backward Q-tile
     negl_prob: float,
 ) -> torch.Tensor:
     """
     Fused mask generation: per-block LSE → packed int32 bitmask.
 
-    Uses _fused_bitmask_kernel with grid=(BH, N).  Each CTA loops over all Tm
-    Q-tiles for one KV-column, accumulates tile_mass[Tm] in registers,
-    thresholds, and packs directly into NUM_WORDS int32 words — no scratch
-    buffer, no intermediate uint8.
-
-    Bit (m % 32) of word (m // 32) of bitmask[b, h, n, :] is set iff Q-block m
-    should be computed for KV-block n.  The C++ backward kernel streams words
-    on-demand via __ldg and uses __ffs() for O(1) next-active-m lookups.
+    The N dimension of tile_lse is passed through unchanged to the output bitmask.
+    For local window attention, both tile_lse and the output bitmask use RELATIVE
+    N indexing (same as the backward C++ kernel expects). Out-of-window entries in
+    tile_lse are pre-filled with -inf by the forward kernel, contributing 0 mass
+    and being pruned automatically — no explicit window masking needed here.
 
     Returns:
         int32 bitmask of shape [B, H, N, NUM_WORDS]
-        where NUM_WORDS = max(32, next_power_of_2(Tm)) // 32
+        where N = tile_lse.shape[3] and NUM_WORDS = max(32, next_power_of_2(Tm)) // 32
 
     Raises:
-        AssertionError if Tm > 2048 (tl.sort limit) or N > 256K (kBlockN=128).
+        AssertionError if Tm > 2048 (tl.sort limit).
     """
     B, H, seq_q, N = tile_lse.shape
     BH = B * H
@@ -178,12 +186,9 @@ def mask_from_stats_fused(
     assert softmax_lse.dtype == torch.float32, f"softmax_lse must be float32, got {softmax_lse.dtype}"
     assert softmax_lse.shape[:2] == (B, H), \
         f"softmax_lse batch/head {softmax_lse.shape[:2]} doesn't match tile_lse (B={B}, H={H})"
+
     assert Tm <= _BITMASK_MAX_TM, \
         f"Tm={Tm} exceeds max supported ({_BITMASK_MAX_TM}); tl.sort limit is 2048 elements"
-
-    # N_PAD must be power of 2 for tl.sort; max 2048 → seq_len ≤ 256K at kBlockN=128
-    N_PAD = _next_power_of_2(N)
-    assert N_PAD <= 2048, f"N_PAD={N_PAD} too large for Triton sort (max 2048)"
 
     stride_lse_b, stride_lse_h, stride_lse_row, stride_lse_n = tile_lse.stride()
     stride_slse_b, stride_slse_h, stride_slse_row = softmax_lse.stride()

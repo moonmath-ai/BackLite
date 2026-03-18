@@ -26,22 +26,20 @@ def _mask_from_stats_compiled(tile_lse, softmax_lse, num_row_tiles, kBlockM_bwd,
     return _mask_from_stats_fused(tile_lse, softmax_lse, num_row_tiles, kBlockM_bwd, negl_prob)
 
 
-def _generate_mask_from_stats_mass(tile_stats, seq_q, head_dim, head_dim_v, dtype, negl_prob, is_causal=False, is_local=False, softcap=0.0, device=None, softmax_lse=None):
+def _generate_mask_from_stats_mass(tile_stats, seq_q, head_dim, head_dim_v, dtype, negl_prob, softmax_lse, is_causal=False, is_local=False, softcap=0.0):
     """
     Generate block sparsity mask from forward per-row tile LSE statistics for backward kernel.
 
-    tile_stats: [batch, head, seq_q, num_n_blocks_fwd], float32 local tile LSE (ln space).
-    softmax_lse: [batch, head, seq_q], float32 — log-sum-exp from FA3 forward (ln space).
+    tile_stats: [batch, head, seq_q, N] float32 — per-block LSE (log2 domain, -inf for masked).
+    softmax_lse: [batch, head, seq_q] float32 — full-row LSE (ln domain) from FA3 forward.
+    N is relative for local window, logical for full/causal attention.
     """
     if tile_stats.dim() != 4: raise ValueError("tile_stats must have shape [batch, head, seq_q, num_n_blocks_fwd]")
     batch, head, actual_seq_q, num_n_blocks_fwd = tile_stats.shape
-    tile_lse = tile_stats
 
     has_softcap = softcap > 0.0
     element_size = 1 if dtype == torch.int8 else (2 if dtype in (torch.float16, torch.bfloat16) else 4)
-    kBlockM_bwd, kBlockN_bwd = flash_attn_3_cuda.get_tile_size_bwd(
-        head_dim, head_dim_v, is_causal, is_local, has_softcap
-    )
+    kBlockM_bwd, kBlockN_bwd = flash_attn_3_cuda.get_tile_size_bwd(head_dim, head_dim_v, is_causal, is_local, has_softcap)
     tile_info_fwd = flash_attn_3_cuda.get_tile_size_fwd_sm90(
         head_dim, head_dim_v, is_causal, is_local,
         element_size, False, False, has_softcap, dtype == torch.int8,
@@ -50,14 +48,11 @@ def _generate_mask_from_stats_mass(tile_stats, seq_q, head_dim, head_dim_v, dtyp
 
     num_row_tiles_bwd = (seq_q + kBlockM_bwd - 1) // kBlockM_bwd
 
-    # Validate mask-generation assumptions
     if softmax_lse is None: raise RuntimeError("Mask generation requires softmax_lse.")
     if kBlockN_bwd != kBlockN_fwd: raise RuntimeError(f"Mask generation requires matching N tile sizes (bwd={kBlockN_bwd}, fwd={kBlockN_fwd}).")
     if seq_q != actual_seq_q: raise RuntimeError(f"Mask generation requires seq_q == tile_stats.shape[2] (seq_q={seq_q}, tile_stats_seq_q={actual_seq_q}).")
-    if seq_q % kBlockM_bwd != 0: raise RuntimeError(f"Mask generation requires seq_q divisible by kBlockM_bwd (seq_q={seq_q}, kBlockM_bwd={kBlockM_bwd}).")
 
-    mask = _mask_from_stats_fused(tile_lse, softmax_lse, num_row_tiles_bwd, kBlockM_bwd, negl_prob).contiguous()
-    # mask is int32[B, H, N, num_words] bitmask
+    mask = _mask_from_stats_fused(tile_stats, softmax_lse, num_row_tiles_bwd, kBlockM_bwd, negl_prob).contiguous()
 
     if os.environ.get('DEBUG_BACKLITE_SPARSITY'):
         # Reconstruct uint8[B, H, Tm, N] view from the int32 bitmask for sparsity stats
@@ -292,15 +287,23 @@ def _back_lite_fwd(
     sm_margin: int,
     negl_prob: float,
     block_n_size: int,
+    block_m_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Returns (out, softmax_lse, tile_stats).
     tile_stats has shape (B, H, T, N_k) when negl_prob > 0, else shape (0,) empty placeholder.
+    N_k = N_local (reduced) when is_local, else N_full.
     """
     _sparse = negl_prob > 0.0
     if _sparse:
         batch, seq_q, heads, head_dim = q.shape
-        num_n_blocks = (k.shape[1] + block_n_size - 1) // block_n_size
+        is_local = window_size_left >= 0 or (not causal and window_size_right >= 0)
+        if is_local:
+            wl = max(window_size_left, 0)
+            wr = 0 if causal else max(window_size_right, 0)
+            num_n_blocks = (wl + wr + block_m_size + block_n_size - 1) // block_n_size + 1
+        else:
+            num_n_blocks = (k.shape[1] + block_n_size - 1) // block_n_size
         tile_stats: Optional[torch.Tensor] = torch.full(
             (batch, heads, num_n_blocks, seq_q), float('-inf'),
             device=q.device, dtype=torch.float32,
@@ -352,13 +355,20 @@ def _back_lite_fwd_fake(
     sm_margin: int,
     negl_prob: float,
     block_n_size: int,
+    block_m_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, D = q.shape
     Dv = v.shape[-1]
     out = torch.empty((B, T, H, Dv), dtype=q.dtype, device=q.device)
     softmax_lse = torch.empty((B, H, T), dtype=torch.float32, device=q.device)
     if negl_prob > 0.0:
-        Nk = (T + block_n_size - 1) // block_n_size
+        is_local = window_size_left >= 0 or (not causal and window_size_right >= 0)
+        if is_local:
+            wl = max(window_size_left, 0)
+            wr = 0 if causal else max(window_size_right, 0)
+            Nk = (wl + wr + block_m_size + block_n_size - 1) // block_n_size + 1
+        else:
+            Nk = (T + block_n_size - 1) // block_n_size
         tile_stats = torch.empty((B, H, Nk, T), dtype=torch.float32, device=q.device).permute(0, 1, 3, 2)
     else:
         tile_stats = q.new_empty(0)
@@ -385,11 +395,13 @@ def _back_lite_bwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     block_mask = None
     if negl_prob > 0.0 and tile_stats.dim() == 4:
-        is_local = (window_size_left >= 0 or window_size_right >= 0) and not causal
+        is_local = window_size_left >= 0 or (not causal and window_size_right >= 0)
+        # FA3 dispatches causal+local as Is_local=True, Is_causal=False.
+        # Pure causal (no finite window) stays Is_causal=True, Is_local=False.
+        fa3_is_causal = causal and not is_local
         block_mask = _generate_mask_from_stats_mass(
-            tile_stats, q.shape[1], q.shape[-1], v.shape[-1], q.dtype, negl_prob,
-            is_causal=causal, is_local=is_local, softcap=softcap,
-            device=q.device, softmax_lse=softmax_lse,
+            tile_stats, q.shape[1], q.shape[-1], v.shape[-1], q.dtype, negl_prob, softmax_lse,
+            is_causal=fa3_is_causal, is_local=is_local, softcap=softcap,
         )
 
     dq = torch.empty_like(q)
@@ -438,7 +450,7 @@ def _back_lite_setup_context(ctx, inputs, output):
      softmax_scale, causal,
      window_size_left, window_size_right,
      softcap, num_splits, deterministic, sm_margin,
-     negl_prob, block_n_size) = inputs
+     negl_prob, block_n_size, block_m_size) = inputs
     out, softmax_lse, tile_stats = output
     ctx.save_for_backward(q, k, v, out, softmax_lse, tile_stats)
     ctx.softmax_scale = softmax_scale
@@ -459,8 +471,8 @@ def _back_lite_backward(ctx, dout, *grads):
         ctx.window_size_left, ctx.window_size_right,
         ctx.softcap, ctx.deterministic, ctx.sm_margin, ctx.negl_prob,
     )
-    # 13 inputs → gradients for q, k, v + None for 10 scalar params
-    return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+    # 14 inputs → gradients for q, k, v + None for 11 scalar params
+    return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None
 
 
 _back_lite_fwd.register_autograd(
@@ -597,7 +609,12 @@ class FlashAttnFunc(torch.autograd.Function):
                 False, False, False, (q.dtype == torch.int8)
             )
             kBlockM, kBlockN = result[0], result[1]
-            num_n_blocks = (k.shape[1] + kBlockN - 1) // kBlockN
+            if fwd_is_local:
+                wl = max(window_size[0], 0)
+                wr = max(window_size[1], 0)
+                num_n_blocks = (wl + wr + kBlockM + kBlockN - 1) // kBlockN + 1
+            else:
+                num_n_blocks = (k.shape[1] + kBlockN - 1) // kBlockN
             # Per-row tile LSE stats: logical shape [batch, heads, seq_q, num_n_blocks].
             # Must be -inf so causally-masked positions (never written by fwd kernel)
             # yield exp(-inf)=0 mass instead of garbage from uninitialized memory.
@@ -669,9 +686,8 @@ class FlashAttnFunc(torch.autograd.Function):
             if tile_stats is not None and tile_stats.dim() == 4 and tile_stats.dtype == torch.float32:
                 is_local = (ctx.window_size[0] >= 0 or ctx.window_size[1] >= 0) and not ctx.causal
                 block_mask = _generate_mask_from_stats_mass(
-                    tile_stats, q.shape[1], q.shape[-1], ctx.head_dim_v, ctx.q_dtype, negl_prob,
+                    tile_stats, q.shape[1], q.shape[-1], ctx.head_dim_v, ctx.q_dtype, negl_prob, softmax_lse,
                     is_causal=ctx.causal, is_local=is_local, softcap=ctx.softcap,
-                    device=q.device, softmax_lse=softmax_lse,
                 )
 
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
@@ -941,15 +957,17 @@ def flash_attn_func(
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
-        # Determine kBlockN for tile_stats shape (needed only when sparse).
+        # Determine kBlockM/kBlockN for tile_stats shape (needed only when sparse).
         if negl_prob > 0.0:
             fwd_is_local = (window_size[0] >= 0 or window_size[1] >= 0) and not causal
             tile_info = flash_attn_3_cuda.get_tile_size_fwd_sm90(
                 q.shape[-1], v.shape[-1], causal, fwd_is_local,
                 q.element_size(), False, False, softcap > 0.0, (q.dtype == torch.int8),
             )
+            block_m_size = int(tile_info[0])
             block_n_size = int(tile_info[1])
         else:
+            block_m_size = 64  # placeholder; tile_stats unused in dense path
             block_n_size = 64  # placeholder; tile_stats unused in dense path
 
         out, softmax_lse_out, _ = _back_lite_fwd(
@@ -957,7 +975,7 @@ def flash_attn_func(
             softmax_scale, causal,
             window_size[0], window_size[1],
             softcap, num_splits, deterministic, sm_margin,
-            negl_prob, block_n_size,
+            negl_prob, block_n_size, block_m_size,
         )
         if return_softmax_lse:
             return out, softmax_lse_out
