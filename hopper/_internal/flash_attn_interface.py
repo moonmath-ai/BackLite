@@ -304,10 +304,11 @@ def _back_lite_fwd(
             num_n_blocks = (wl + wr + block_m_size + block_n_size - 1) // block_n_size + 1
         else:
             num_n_blocks = (k.shape[1] + block_n_size - 1) // block_n_size
+        seq_q_pad = (seq_q + block_m_size - 1) // block_m_size * block_m_size
         tile_stats: Optional[torch.Tensor] = torch.full(
-            (batch, heads, num_n_blocks, seq_q), float('-inf'),
+            (batch, heads, num_n_blocks, seq_q_pad), float('-inf'),
             device=q.device, dtype=torch.float32,
-        ).permute(0, 1, 3, 2)  # [B,H,T,N] with stride_m=1 (non-contiguous is intentional)
+        ).permute(0, 1, 3, 2)  # [B,H,seq_q_pad,N] stride_m=1 (non-contiguous is intentional)
         # NOTE: do NOT call .contiguous() here – permute gives stride_m=1 which the
         # FA3 forward kernel requires when writing tile_stats.  Calling .contiguous()
         # would relayout to stride_m=N, causing cudaErrorMisalignedAddress in the kernel.
@@ -335,7 +336,8 @@ def _back_lite_fwd(
     )
 
     if _sparse:
-        return out, softmax_lse, tile_stats
+        # Slice back to actual seq_q rows (discarding the padding rows)
+        return out, softmax_lse, tile_stats[:, :, :seq_q, :]
     else:
         return out, softmax_lse, q.new_empty(0)
 
@@ -369,7 +371,8 @@ def _back_lite_fwd_fake(
             Nk = (wl + wr + block_m_size + block_n_size - 1) // block_n_size + 1
         else:
             Nk = (T + block_n_size - 1) // block_n_size
-        tile_stats = torch.empty((B, H, Nk, T), dtype=torch.float32, device=q.device).permute(0, 1, 3, 2)
+        T_pad = (T + block_m_size - 1) // block_m_size * block_m_size
+        tile_stats = torch.empty((B, H, Nk, T_pad), dtype=torch.float32, device=q.device).permute(0, 1, 3, 2)[:, :, :T, :]
     else:
         tile_stats = q.new_empty(0)
     return out, softmax_lse, tile_stats
