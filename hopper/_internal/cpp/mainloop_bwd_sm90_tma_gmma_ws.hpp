@@ -249,6 +249,8 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(SmemLayoutK{}) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(SmemLayoutV{}) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesLSE = static_cast<uint32_t>(size(select<0>(SmemLayoutLSE{})) * cutlass::sizeof_bits_v<ElementAccum> / 8);
+    static constexpr uint32_t TmaTransactionBytesdO = TmaTransactionBytesQ;
+    static constexpr uint32_t TmaTransactionBytesdPsum = TmaTransactionBytesLSE;
 
     // These are tuned for speed. They don't affect correctness.
     // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
@@ -427,104 +429,161 @@ struct CollectiveMainloopBwdSm90 {
         cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
     }
 
-    // ── Block-sparsity mask helpers (streaming multi-word bitmask) ──────────
+    // ── Block-sparsity mask helpers (producer-owned streaming iterator) ──────
     // Layout: ptr_block_mask[( bidb*H + bidh ) * num_col_tiles * num_mask_words
     //                        + n_block * num_mask_words + word]
     // Bit (m % 32) of word (m / 32) is set iff Q-block m is active.
-    // num_mask_words = params.num_row_tiles  (repurposed field).
-    //
-    // MaskBits stores only a pointer + num_words (2 registers).  Words are loaded
-    // on-demand via __ldg (read-only L2 cache) in next_active — zero fixed-array
-    // allocation, scales to arbitrary Tm.  L2 latency is hidden by the TMA
-    // pipeline stalls surrounding each bwd_step call.
-    struct MaskBits {
-        int const* ptr;  // nullptr = all active (no mask); points to list of active m_block indices
-        const int length;        // number of active m_blocks; 0 when ptr == nullptr
-        const uint32_t word;
-        mutable int curr_idx = -1;
+    CUTLASS_DEVICE static uint32_t const*
+    get_mask_ptr(Params const& params, int bidb, int bidh, int n_block) {
+        if (params.ptr_block_mask == nullptr) { return nullptr; }
+        int const num_heads = get<2>(params.shape_Q);
+        int const num_words = params.num_row_tiles;
+        int const num_cols = params.num_col_tiles;
+        return params.ptr_block_mask
+            + (int64_t(bidb) * num_heads + bidh) * num_cols * num_words
+            + n_block * num_words;
+    }
 
-        CUTLASS_DEVICE bool has_more() const {
-            // return (curr_idx + 1 < length) && (ptr != nullptr);
-            return (curr_idx + 1 < length);
+    struct SparseWordIterator {
+        uint32_t const* ptr = nullptr;
+        int num_words = 0;
+        int m_block_min = 0;
+        int m_block_max = 0;
+        int cur_word_idx = 0;
+        int next_word_idx = 0;
+        uint32_t cur_word = 0;
+        uint32_t next_word = 0;
+
+        CUTLASS_DEVICE SparseWordIterator() {}
+
+        CUTLASS_DEVICE
+        SparseWordIterator(uint32_t const* ptr_, int num_words_, int m_block_min_, int m_block_max_)
+            : ptr(ptr_)
+            , num_words(num_words_)
+            , m_block_min(m_block_min_)
+            , m_block_max(m_block_max_) {
+            if (ptr == nullptr || num_words == 0 || m_block_min >= m_block_max) {
+                cur_word_idx = num_words;
+                next_word_idx = num_words;
+                return;
+            }
+            cur_word_idx = max(0, m_block_min >> 5);
+            advance_to_next_nonzero(cur_word_idx, cur_word);
+            next_word_idx = cur_word_idx < num_words ? cur_word_idx + 1 : num_words;
+            advance_to_next_nonzero(next_word_idx, next_word);
         }
 
-        CUTLASS_DEVICE int next_active() const {
-            // if (ptr == nullptr) return -1;
-            curr_idx++;
-            int m_block = ptr[curr_idx];
+        CUTLASS_DEVICE bool has_more() const {
+            return cur_word != 0;
+        }
+
+        CUTLASS_DEVICE int next_active() {
+            int const bit = __ffs(cur_word) - 1;
+            int const m_block = cur_word_idx * 32 + bit;
+            cur_word &= cur_word - 1;
+            if (cur_word == 0) {
+                cur_word_idx = next_word_idx;
+                cur_word = next_word;
+                next_word_idx = cur_word_idx < num_words ? cur_word_idx + 1 : num_words;
+                advance_to_next_nonzero(next_word_idx, next_word);
+            }
             return m_block;
         }
 
-        // True iff Q-block m is active.
-        CUTLASS_DEVICE bool is_active(int m) const {
-            return (word & (1u << (m % 32))) != 0;
+    private:
+        CUTLASS_DEVICE uint32_t load_clamped_word(int word_idx) const {
+            if (word_idx < 0 || word_idx >= num_words) { return 0; }
+            int const word_start = word_idx * 32;
+            int const word_end = word_start + 32;
+            int const clamp_start = max(m_block_min, word_start);
+            int const clamp_end = min(m_block_max, word_end);
+            if (clamp_start >= clamp_end) { return 0; }
+            uint32_t word = __ldg(ptr + word_idx);
+            int const start_bit = clamp_start - word_start;
+            int const end_bit = clamp_end - word_start;
+            word &= 0xFFFFFFFFu << start_bit;
+            if (end_bit < 32) {
+                word &= (uint32_t(1) << end_bit) - 1u;
+            }
+            return word;
         }
 
-        // // True iff Q-block m is active.
-        // CUTLASS_DEVICE bool is_active(int m) const {
-        //     if (ptr == nullptr) return true;
-        //     int w = m >> 5;
-        //     if (w >= num_words) return false;
-        //     return (__ldg(ptr + w) >> (m & 31)) & 1u;
-        // }
-
-        // // Smallest i in [m, m_end) with bit i set, or m_end if none.
-        // // Loads each 32-bit word on-demand via __ldg; uses __ffs for O(1) per word.
-        // // For the no-mask case, returns m immediately (zero memory access).
-        // CUTLASS_DEVICE int next_active(int m, int m_end) const {
-        //     if (ptr == nullptr) return m;   // all active — no memory access
-        //     for (int cur_m = m; cur_m < m_end; ) {
-        //         int w   = cur_m >> 5;
-        //         int bit = cur_m & 31;
-        //         if (w >= num_words) break;
-        //         uint32_t remaining = __ldg(ptr + w) >> bit;
-        //         int limit = m_end - (w * 32 + bit);   // > 0 since cur_m < m_end
-        //         if (limit < 32) remaining &= (1u << limit) - 1u;
-        //         if (remaining) return w * 32 + bit + __ffs(remaining) - 1;
-        //         cur_m = (w + 1) * 32;  // advance to next word boundary
-        //     }
-        //     return m_end;
-        // }
+        CUTLASS_DEVICE void advance_to_next_nonzero(int &word_idx, uint32_t &word) const {
+            while (word_idx < num_words) {
+                word = load_clamped_word(word_idx);
+                if (word != 0) { return; }
+                ++word_idx;
+            }
+            word = 0;
+        }
     };
 
-    // Build a MaskBits for (bidb, bidh, n_block): stores pointer + word count.
-    // No data loaded at startup — words are fetched lazily in next_active.
-    template <typename SharedStorage>
-    CUTLASS_DEVICE static MaskBits
-    get_mask_words(Params const& params, int bidb, int bidh, int n_block, SharedStorage &shared_storage) {
-        if (params.ptr_block_mask == nullptr) {
-            return {nullptr, 0, 0u, -1};
-        }
-        int num_heads = get<2>(params.shape_Q);
-        int num_words = params.num_row_tiles;   // num_mask_words
-        int num_cols  = params.num_col_tiles;   // N
-        uint32_t const* ptr = params.ptr_block_mask
-                + (int64_t(bidb) * num_heads + bidh) * num_cols * num_words
-                + n_block * num_words;
-
-        uint32_t first_word = (num_words > 0) ? __ldg(ptr) : 0u;
-        int length = __popc(first_word);
-
-        if (threadIdx.x < 32){
-            int lane = threadIdx.x % 32; // TODO: varify that the shape of the grid is flat
-
-            uint32_t lane_mask = 0xFFFFFFFFu >> (31 - lane);
-            uint32_t mask = first_word & lane_mask;
-            int save_location = __popc(mask) - 1;
-            bool is_set = (first_word & (1u << lane)) != 0;
-            if (is_set) {
-                shared_storage.compatition_m_blocks[save_location] = lane;
-            }
-
-            // if (cute::thread0()) {
-            //     printf("first_word: %d, save_location: %d, lane: %d, is_set: %d\n", first_word, save_location, lane, is_set);
-            // }
-            // shared_storage.compatition_m_blocks[lane] = lane;
-        }
-
-        // return {ptr, num_words};
-        return {shared_storage.compatition_m_blocks, length, first_word, -1};
+    // For local window with relative bitmask: compute the forward kernel's n_block_min
+    // for a given m_block. This matches block.h get_n_block_min_max Is_local branch.
+    CUTLASS_DEVICE static int
+    get_n_block_min_fwd(int m_block, int seqlen_q, int seqlen_k, int window_size_left) {
+        int n_idx_left = m_block * kBlockM + seqlen_k - seqlen_q - window_size_left;
+        return max(0, n_idx_left / kBlockN);
     }
+
+    CUTLASS_DEVICE static bool
+    is_mask_block_active(Params const& params, int bidb, int bidh, int n_block, int m_block) {
+        if constexpr (Is_local) {
+            // Relative bitmask: N dimension is N_local, indexed by relative offset r.
+            int const seqlen_q = get<0>(params.shape_Q);
+            int const seqlen_k = size<0>(params.shape_K);
+            int const n_min_fwd = get_n_block_min_fwd(m_block, seqlen_q, seqlen_k, params.window_size_left);
+            int const r = n_block - n_min_fwd;
+            if (r < 0 || r >= params.num_col_tiles) { return true; }  // outside bitmask range → assume active
+            uint32_t const* ptr = get_mask_ptr(params, bidb, bidh, r);
+            if (ptr == nullptr) { return true; }
+            int const word_idx = m_block >> 5;
+            if (word_idx < 0 || word_idx >= params.num_row_tiles) { return false; }
+            uint32_t const word = __ldg(ptr + word_idx);
+            return ((word >> (m_block & 31)) & 1u) != 0;
+        } else {
+            uint32_t const* ptr = get_mask_ptr(params, bidb, bidh, n_block);
+            if (ptr == nullptr) { return true; }
+            int const word_idx = m_block >> 5;
+            if (word_idx < 0 || word_idx >= params.num_row_tiles) { return false; }
+            uint32_t const word = __ldg(ptr + word_idx);
+            return ((word >> (m_block & 31)) & 1u) != 0;
+        }
+    }
+
+    struct LocalSparseWordIterator {
+        Params const& params;
+        int bidb, bidh, n_block;
+        int m_block_max;
+        int next_m;
+
+        CUTLASS_DEVICE
+        LocalSparseWordIterator(Params const& params_, int bidb_, int bidh_, int n_block_, int m_block_min_, int m_block_max_)
+            : params(params_), bidb(bidb_), bidh(bidh_), n_block(n_block_), m_block_max(m_block_max_), next_m(m_block_min_) {
+            advance();
+        }
+
+        CUTLASS_DEVICE bool has_more() const {
+            return next_m < m_block_max;
+        }
+
+        CUTLASS_DEVICE int next_active() {
+            int ret = next_m;
+            ++next_m;
+            advance();
+            return ret;
+        }
+
+    private:
+        CUTLASS_DEVICE void advance() {
+            while (next_m < m_block_max) {
+                if (is_mask_block_active(params, bidb, bidh, n_block, next_m)) {
+                    return;
+                }
+                ++next_m;
+            }
+        }
+    };
 
     template <typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
@@ -539,6 +598,8 @@ struct CollectiveMainloopBwdSm90 {
          ) {
 
         auto [n_block, bidh, bidb] = block_coord;
+        bool const is_sparse = params.ptr_block_mask != nullptr;
+        bool const use_sparse_streaming = is_sparse && !Deterministic;
         SeqlenInfo_t seqlen_info{
             bidb, get<0>(params.shape_Q), size<0>(params.shape_K),
             params.cu_seqlens_q, params.cu_seqlens_k, params.seqused_q, params.seqused_k
@@ -553,21 +614,6 @@ struct CollectiveMainloopBwdSm90 {
                 return;
             }
         }
-        MaskBits active = get_mask_words(params, bidb, bidh, n_block, shared_storage);
-        // TODO: add a sync or a fance for shared memory
-        __threadfence_block();
-
-        // int m_block_first = active.next_active(m_block_min, m_block_max);
-        // if (m_block_first >= m_block_max) {
-        //     scheduler_prefetch();
-        //     return;
-        // }
-
-        if (!active.has_more()) {
-            scheduler_prefetch();
-            return;
-        }
-        int m_block_first = active.next_active();
 
         Tensor sQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()), SmemLayoutQ{});
         Tensor sdO = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_do.data()), SmemLayoutdO{});
@@ -626,51 +672,126 @@ struct CollectiveMainloopBwdSm90 {
             }
         }
 
-        int m_block = m_block_first;
-
-        int lane_predicate = cute::elect_one_sync();
+        bool const lane_predicate = cute::elect_one_sync();
+        auto complete_empty_q_stage = [&](PipelineState stage) {
+            shared_storage.q_tile_id[stage.index()] = -1;
+            pipeline_q.producer_commit(stage, [&](auto* full_barrier) {
+                cutlass::arch::ClusterTransactionBarrier::complete_transaction(
+                    full_barrier,
+                    cute::block_rank_in_cluster(),
+                    TmaTransactionBytesQ + TmaTransactionBytesLSE);
+            });
+        };
+        auto complete_empty_do_stage = [&](PipelineState_dO stage) {
+            pipeline_do.producer_commit(stage, [&](auto* full_barrier) {
+                cutlass::arch::ClusterTransactionBarrier::complete_transaction(
+                    full_barrier,
+                    cute::block_rank_in_cluster(),
+                    TmaTransactionBytesdO + TmaTransactionBytesdPsum);
+            });
+        };
 
         if (lane_predicate) {
-            pipeline_q.producer_acquire(smem_pipe_write);
-            copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
-                 tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
-            copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
-                 gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
-        }
+            if (use_sparse_streaming) {
+                auto do_streaming = [&](auto& active) {
+                    if (!active.has_more()) {
+                        PipelineState q_terminal_state = smem_pipe_write;
+                        pipeline_q.producer_acquire(q_terminal_state);
+                        // Publish a metadata-only terminal stage so consumers can exit without
+                        // rebuilding sparse iteration or reading the mask from gmem.
+                        complete_empty_q_stage(q_terminal_state);
+                        ++smem_pipe_write;
 
-        // // Wait for the MMA warpgroups to say that smem_k and smem_v are ready
-        // cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
+                        PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(q_terminal_state, smem_pipe_write_do);
+                        pipeline_do.producer_acquire(smem_pipe_write_do_cur);
+                        complete_empty_do_stage(smem_pipe_write_do_cur);
+                        if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
+                    } else {
+                        int m_block = active.next_active();
+                        pipeline_q.producer_acquire(smem_pipe_write);
+                        shared_storage.q_tile_id[smem_pipe_write.index()] = m_block;
+                        copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                            tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
+                        copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
+                            gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
 
-        if (lane_predicate) {
-            // Copy K tile and V tile from GMEM to SMEM.
-            shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
-            copy(params.tma_load_K.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tKgK, tKsK);
-            copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tVgV, tVsV);
+                        shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
+                        copy(params.tma_load_K.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tKgK, tKsK);
+                        copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tVgV, tVsV);
 
-            while (true) {
-                // If Q and dO have the same number of stages, we can use the same pipeline state variable
-                // to reduce registers
-                PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
-                pipeline_do.producer_acquire(smem_pipe_write_do_cur);
-                copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
-                     tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
-                copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
-                     gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
-                if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
+                        while (true) {
+                            PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
+                            pipeline_do.producer_acquire(smem_pipe_write_do_cur);
+                            copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                                tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
+                            copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
+                                gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
+                            if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
 
-                ++smem_pipe_write;
-                if (!active.has_more()) { break; }
-                m_block = active.next_active();
+                            ++smem_pipe_write;
+                            if (!active.has_more()) { break; }
+                            m_block = active.next_active();
 
-                // m_block = active.next_active( m_block + 1, m_block_max);
-                // ++smem_pipe_write;
-                // if (m_block >= m_block_max) { break; }
+                            pipeline_q.producer_acquire(smem_pipe_write);
+                            shared_storage.q_tile_id[smem_pipe_write.index()] = m_block;
+                            copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                                tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
+                            copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
+                                gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
+                        }
 
+                        PipelineState q_terminal_state = smem_pipe_write;
+                        pipeline_q.producer_acquire(q_terminal_state);
+                        // Mirror the terminal record on both Q/LSE and dO/dPsum pipelines so
+                        // mma() can terminate from stage metadata alone.
+                        complete_empty_q_stage(q_terminal_state);
+                        ++smem_pipe_write;
+
+                        PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(q_terminal_state, smem_pipe_write_do);
+                        pipeline_do.producer_acquire(smem_pipe_write_do_cur);
+                        complete_empty_do_stage(smem_pipe_write_do_cur);
+                        if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
+                    }
+                };
+
+                if constexpr (Is_local) {
+                    LocalSparseWordIterator active(params, bidb, bidh, n_block, m_block_min, m_block_max);
+                    do_streaming(active);
+                } else {
+                    SparseWordIterator active(get_mask_ptr(params, bidb, bidh, n_block), params.num_row_tiles, m_block_min, m_block_max);
+                    do_streaming(active);
+                }
+            } else {
+                int m_block = m_block_min;
                 pipeline_q.producer_acquire(smem_pipe_write);
                 copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
                      tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
                 copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
                      gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
+
+                shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
+                copy(params.tma_load_K.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tKgK, tKsK);
+                copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0 /*mcast_mask*/), tVgV, tVsV);
+
+                while (true) {
+                    PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
+                    pipeline_do.producer_acquire(smem_pipe_write_do_cur);
+                    copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                         tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
+                    copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
+                         gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
+                    if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
+
+                    ++smem_pipe_write;
+                    if (m_block + 1 >= m_block_max) { break; }
+                    ++m_block;
+
+                    pipeline_q.producer_acquire(smem_pipe_write);
+                    copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                         tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
+                    copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
+                         gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
+                }
             }
         }
         scheduler_prefetch();
@@ -730,10 +851,6 @@ struct CollectiveMainloopBwdSm90 {
         if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return; }
         }
-        MaskBits active = get_mask_words(params, bidb, bidh, n_block, shared_storage);
-        // int m_block = active.next_active( m_block_min, m_block_max);
-        // int m_block = active.next_active();
-        // int m_block = active.has_more() ? active.next_active() : m_block_max;
 
         Tensor sdQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_dqacc.data()), SmemLayoutdQaccum{});
         static constexpr int dQ_TMA_num_bytes = CUTE_STATIC_V(size<0>(sdQ)) * sizeof(ElementAccum);
@@ -749,85 +866,133 @@ struct CollectiveMainloopBwdSm90 {
         int *lock_ptr = !Deterministic ? nullptr : params.dq_semaphore + bidb * num_head + bidh;
         using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>;
         bool const lane_predicate = cute::elect_one_sync();
+        bool const is_sparse = params.ptr_block_mask != nullptr;
 
-        // last do tile
-        // if (m_block >= m_block_max) {
-        if (!active.has_more()) {
-            // No active tiles — handle deterministic barriers if needed
-            if constexpr (Deterministic) {
-                #pragma unroll 2
-                for (int m = m_block_min; m < m_block_max; ++m) {
-                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m * num_batch * num_head, n_block);
-                    Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m * num_batch * num_head);
-                }
-                if constexpr (Is_local) {
-                    constexpr int kBlockM = get<0>(TileShape_MNK{});
-                    int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
-                    #pragma unroll 2
-                    for (int m = m_block_max; m < m_block_global_max; ++m) {
-                        Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m * num_batch * num_head);
+        if (is_sparse) {
+            if constexpr (!Deterministic) {
+                while (true) {
+                    int warpgroup_idx = 0;
+                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                      static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);
+                    int const m_block = shared_storage.dq_tile_id[warpgroup_idx];
+                    if (m_block == -1) {
+                        #pragma unroll
+                        for (warpgroup_idx = 1; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
+                            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                              static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);
+                        }
+                        for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto wg_idx) {
+                            cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                                static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + wg_idx /*id*/);
+                        });
+                        return;
                     }
-                }
-            }
-            return;
-        }
-        if constexpr (!Deterministic) {
-            CUTLASS_PRAGMA_NO_UNROLL
-            do{
-                int warpgroup_idx = 0;
-                cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);  // sdQ full, to be written to gmem
-
-                int m_block = active.next_active();
-
-                if (lane_predicate) {
-                    SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
-                    tma_store_arrive();
-                }
-
-                #pragma unroll
-                for (warpgroup_idx = 1; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
-                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);  // sdQ full, to be written to gmem
-
-                    // int m_block = active.next_active();
 
                     if (lane_predicate) {
-                        SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                        SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()),
+                                                  raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()),
+                                                  dQ_TMA_num_bytes,
+                                                  static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
                         tma_store_arrive();
                     }
-                }
-                // Note, the for_each() function is required here to ensure `warpgroup_idx` is of type Int<x>.
-                for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto warpgroup_idx) {
-                    if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(warpgroup_idx)>(); }
-                    cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);  // sdQ empty, ready to be written to
-                });
-            }while(active.has_more());
-            return;
-        }else{
-            // Deterministic: iterate ALL m-blocks for barrier ordering, check mask per tile
-            #pragma unroll 2
-            for (int m_blk = m_block_min; m_blk < m_block_max; ++m_blk) {
-                bool const is_block_active = active.is_active(m_blk);
-                if constexpr (Deterministic) {
-                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_blk * num_batch * num_head, n_block);
-                }
-                if (is_block_active) {
                     #pragma unroll
-                    for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
-                        cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);
+                    for (warpgroup_idx = 1; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
+                        cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                          static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);
                         if (lane_predicate) {
-                            SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_blk).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                            SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()),
+                                                      raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()),
+                                                      dQ_TMA_num_bytes,
+                                                      static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
                             tma_store_arrive();
                         }
                     }
-                    // Note, the for_each() function is required here to ensure `warpgroup_idx` is of type Int<x>.
-                    for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto warpgroup_idx) {
-                        if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(warpgroup_idx)>(); }
-                        cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);
+                    for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto wg_idx) {
+                        if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(wg_idx)>(); }
+                        cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                            static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + wg_idx /*id*/);
                     });
                 }
-                if constexpr (Deterministic) {
+            } else {
+                #pragma unroll 2
+                for (int m_blk = m_block_min; m_blk < m_block_max; ++m_blk) {
+                    bool const is_block_active = is_mask_block_active(params, bidb, bidh, n_block, m_blk);
+                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_blk * num_batch * num_head, n_block);
+                    if (is_block_active) {
+                        #pragma unroll
+                        for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
+                            cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                              static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);
+                            if (lane_predicate) {
+                                SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()),
+                                                          raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_blk).data()),
+                                                          dQ_TMA_num_bytes,
+                                                          static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                                tma_store_arrive();
+                            }
+                        }
+                        for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto wg_idx) {
+                            if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(wg_idx)>(); }
+                            cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                                static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + wg_idx /*id*/);
+                        });
+                    }
                     Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_blk * num_batch * num_head);
                 }
+            }
+        } else if constexpr (!Deterministic) {
+            for (int m_block = m_block_min; m_block < m_block_max; ++m_block) {
+                int warpgroup_idx = 0;
+                cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                  static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);
+                if (lane_predicate) {
+                    SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()),
+                                              raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()),
+                                              dQ_TMA_num_bytes,
+                                              static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                    tma_store_arrive();
+                }
+                #pragma unroll
+                for (warpgroup_idx = 1; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
+                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                      static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);
+                    if (lane_predicate) {
+                        SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()),
+                                                  raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()),
+                                                  dQ_TMA_num_bytes,
+                                                  static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                        tma_store_arrive();
+                    }
+                }
+                for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto wg_idx) {
+                    if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(wg_idx)>(); }
+                    cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                        static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + wg_idx /*id*/);
+                });
+            }
+            return;
+        } else {
+            #pragma unroll 2
+            for (int m_blk = m_block_min; m_blk < m_block_max; ++m_blk) {
+                Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_blk * num_batch * num_head, n_block);
+                #pragma unroll
+                for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
+                    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                      static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warpgroup_idx /*id*/);
+                    if (lane_predicate) {
+                        SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()),
+                                                  raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_blk).data()),
+                                                  dQ_TMA_num_bytes,
+                                                  static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                        tma_store_arrive();
+                    }
+                }
+                for_each(make_int_sequence<NumMmaWarpGroups>{}, [&] (auto wg_idx) {
+                    if (lane_predicate) { tma_store_wait<NumMmaWarpGroups - 1 - CUTE_STATIC_V(wg_idx)>(); }
+                    cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                        static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + wg_idx /*id*/);
+                });
+                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_blk * num_batch * num_head);
             }
         }
         if constexpr (Is_local && Deterministic) {
@@ -986,21 +1151,12 @@ struct CollectiveMainloopBwdSm90 {
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
             params.attention_chunk_divmod, params.qhead_per_khead_divmod
         );
-
-        // Block sparsity — byte-pointer for next-active-m scanning
-        MaskBits active = get_mask_words(params, bidb, bidh, n_block, shared_storage);
-        // int m_block = active.next_active( m_block_min, m_block_max);
-        // if (m_block >= m_block_max) { return false; }
-        if (!active.has_more()) { return false; }
-        // int m_block = active.next_active();
-
+        bool const is_sparse = params.ptr_block_mask != nullptr;
+        bool const use_sparse_streaming = is_sparse && !Deterministic;
 
         clear(tdKrdK);
         clear(tdVrdV);
         // tiled_mma_dKV.accumulate_ = GMMA::ScaleOut::Zero;
-
-        cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.pipelines.barrier_KV.try_wait(work_idx % 2));
-        if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.pipelines.barrier_KV.wait(work_idx % 2); }
 
         if constexpr (Mma_dP_is_RS) {
             using SmemCopyAtomV = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
@@ -1011,9 +1167,24 @@ struct CollectiveMainloopBwdSm90 {
             cute::copy(smem_tiled_copy_V, tdPsV_copy_view, tdPrV_copy_view);
         }
 
-        auto bwd_step = [&](int m_block, auto mask_fn) {
+        bool const dq_tile_publisher = (thread_idx % cutlass::NumThreadsPerWarpGroup) == 0;
+        auto publish_dq_terminal = [&] {
+            if constexpr (dQacc_use_TMA) {
+                int const warp_group_idx = flash::canonical_warp_group_idx_nosync() - 1;
+                cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                  static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warp_group_idx /*id*/);
+                if (dq_tile_publisher) {
+                    shared_storage.dq_tile_id[warp_group_idx] = -1;
+                }
+                cutlass::arch::fence_view_async_shared();
+                cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
+                                                    static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warp_group_idx /*id*/);
+            }
+        };
+
+        auto bwd_step = [&](int m_block, auto mask_fn, bool q_stage_ready=false, bool do_stage_ready=false) {
             Tensor tSrS = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
-            consumer_wait(pipeline_q, smem_pipe_read);
+            if (!q_stage_ready) { consumer_wait(pipeline_q, smem_pipe_read); }
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/SdP_swapAB>(tiled_mma_SdP, tSrQ(_, _, _, smem_pipe_read.index()), tSrK, tSrS);
             Tensor tLSErLSE = cute::conditional_return<!ShuffleLSE>(make_fragment_like(tLSEsLSE(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
             if constexpr (!ShuffleLSE) {
@@ -1027,7 +1198,7 @@ struct CollectiveMainloopBwdSm90 {
             }
             Tensor tdPrdP = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
             PipelineState_dO smem_pipe_read_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_read, smem_pipe_read_do);
-            consumer_wait(pipeline_do, smem_pipe_read_do_cur);
+            if (!do_stage_ready) { consumer_wait(pipeline_do, smem_pipe_read_do_cur); }
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/SdP_swapAB>(tiled_mma_dP, tdPrdO(_, _, _, smem_pipe_read_do_cur.index()), tdPrV, tdPrdP);
             warpgroup_wait<1>();
             if constexpr (Has_softcap) { flash::apply_softcap(tSrS, params.softcap_val); }
@@ -1133,6 +1304,11 @@ struct CollectiveMainloopBwdSm90 {
                     cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warp_group_idx /*id*/);  // sdQ full, to be written to gmem
                     Tensor taccdQrdQ = r2s_thr_copy_dQaccum.retile_S(tdQrdQ);
                     cute::copy(r2s_tiled_copy_dQaccum, taccdQrdQ, tdQsdQaccum);
+                    if (dq_tile_publisher) {
+                        // store_dq() consumes only this published tile id plus dQFullWG*
+                        // handshakes; it never rebuilds the sparse iterator.
+                        shared_storage.dq_tile_id[warp_group_idx] = m_block;
+                    }
                     cutlass::arch::fence_view_async_shared();
                     cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQFullWG1) + warp_group_idx /*id*/);  // sdQ full, to be written to gmem
                 } else {
@@ -1180,56 +1356,107 @@ struct CollectiveMainloopBwdSm90 {
             if constexpr (!Q_dO_same_stages) { ++smem_pipe_read_do; }
         };
 
-        // int m_block = active.next_active();
-
-        // We have separate iterations with causal masking. Not necessary for hdim 128 but for hdim 64
-        // this helps quite a bit to not have to do causal masking for most of the iterations.
-        if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
-            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
-            static constexpr int kBlockM = get<0>(TileShape_MNK{});
-            int const m_block_masking_max = ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1;
-            int const m_block_end = std::min(m_block_max, m_block_masking_max);
-            CUTLASS_PRAGMA_NO_UNROLL
-            // while (m_block < m_block_end) {
-            int m_block = -1;
-            while (active.has_more() && m_block < m_block_end) {
-            // while (active.has_more()) {
-                m_block = active.next_active();
-                bwd_step(m_block, mask_fn);
-                // // m_block = active.next_active( m_block + 1, m_block_max);
-                // m_block = active.next_active();
-            }
-        }
-
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
+        int const m_block_masking_max = ((n_block + 1) * kBlockN - 1 + seqlen_q - seqlen_k - params.window_size_right) / kBlockM + 1;
         int const m_block_max_before_local_mask = !Is_local || !SeparateMaskingIterations
             ? m_block_max
             : std::min(m_block_max, (n_block * kBlockN + seqlen_q - seqlen_k + params.window_size_left) / kBlockM);
 
-        auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block); };
+        auto run_sparse_masked_step = [&](int m_block) {
+            if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
+                if (m_block < std::min(m_block_max, m_block_masking_max)) {
+                    auto sparse_mask_fn = [&](auto& tSrS, int block_m) {
+                        mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, block_m, n_block);
+                    };
+                    bwd_step(m_block, sparse_mask_fn, true, true);
+                    return;
+                }
+            }
+            if constexpr (Is_local && SeparateMaskingIterations) {
+                if (m_block >= m_block_max_before_local_mask) {
+                    auto sparse_mask_fn = [&](auto& tSrS, int block_m) {
+                        mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, block_m, n_block);
+                    };
+                    bwd_step(m_block, sparse_mask_fn, true, true);
+                    return;
+                }
+            }
+            auto sparse_mask_fn = [&](auto& tSrS, int block_m) {
+                mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, block_m, n_block);
+            };
+            bwd_step(m_block, sparse_mask_fn, true, true);
+        };
 
-        int m_block = -1;
-        CUTLASS_PRAGMA_NO_UNROLL
-        // while (m_block < m_block_max_before_local_mask) {
-        while (active.has_more() && m_block < m_block_max_before_local_mask) {
-        // while (active.has_more()) {
-            m_block = active.next_active();
-            bwd_step(m_block, mask_fn);
-            // // m_block = active.next_active( m_block + 1, m_block_max);
-            // m_block = active.next_active();
-        }
+        if (use_sparse_streaming) {
+            auto consumer_wait_once = [&](auto& pipeline, auto& state) {
+                auto barrier_token = pipeline.consumer_try_wait(state);
+                pipeline.consumer_wait(state, barrier_token);
+            };
+            bool kv_ready = false;
+            bool processed_any_tile = false;
 
-        if constexpr (Is_local && SeparateMaskingIterations) {
-            auto mask_fn = [&](auto& tSrS, int m_block) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block); };
+            while (true) {
+                consumer_wait_once(pipeline_q, smem_pipe_read);
+                int const sparse_m_block = shared_storage.q_tile_id[smem_pipe_read.index()];
+                PipelineState_dO smem_pipe_read_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_read, smem_pipe_read_do);
+                consumer_wait_once(pipeline_do, smem_pipe_read_do_cur);
+
+                if (sparse_m_block == -1) {
+                    pipeline_do.consumer_release(smem_pipe_read_do_cur);
+                    pipeline_q.consumer_release(smem_pipe_read);
+                    ++smem_pipe_read;
+                    if constexpr (!Q_dO_same_stages) { ++smem_pipe_read_do; }
+                    // Publish a terminal dQ tile record for each MMA warpgroup so store_dq()
+                    // can drain and exit using only the existing dQFull/dQEmpty barriers.
+                    publish_dq_terminal();
+                    if (!processed_any_tile) {
+                        if constexpr (Q_dO_same_stages) { smem_pipe_read_do = smem_pipe_read; }
+                        return false;
+                    }
+                    break;
+                }
+
+                if (!kv_ready) {
+                    cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.pipelines.barrier_KV.try_wait(work_idx % 2));
+                    if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.pipelines.barrier_KV.wait(work_idx % 2); }
+                    kv_ready = true;
+                }
+
+                run_sparse_masked_step(sparse_m_block);
+                processed_any_tile = true;
+            }
+        } else {
+            cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.pipelines.barrier_KV.try_wait(work_idx % 2));
+            if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.pipelines.barrier_KV.wait(work_idx % 2); }
+
+            if constexpr ((Is_causal || Is_local) && SeparateMaskingIterations) {
+                auto mask_fn = [&](auto& tSrS, int block_m) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, block_m, n_block); };
+                int m_block = m_block_min;
+                CUTLASS_PRAGMA_NO_UNROLL
+                while (m_block < std::min(m_block_max, m_block_masking_max)) {
+                    bwd_step(m_block, mask_fn);
+                    ++m_block;
+                }
+            }
+
+            auto mask_fn = [&](auto& tSrS, int block_m) {
+                mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, block_m, n_block);
+            };
+            int m_block = ((Is_causal || Is_local) && SeparateMaskingIterations) ? std::min(m_block_max, m_block_masking_max) : m_block_min;
             CUTLASS_PRAGMA_NO_UNROLL
-            int m_block = -1;
-            while (active.has_more() && m_block < m_block_max) {
-            // while (active.has_more()) {
-                m_block = active.next_active();
+            while (m_block < m_block_max_before_local_mask) {
                 bwd_step(m_block, mask_fn);
-                // // m_block = active.next_active( m_block + 1, m_block_max);
-                // m_block = active.next_active();
+                ++m_block;
+            }
+
+            if constexpr (Is_local && SeparateMaskingIterations) {
+                auto local_mask_fn = [&](auto& tSrS, int block_m) { mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, block_m, n_block); };
+                CUTLASS_PRAGMA_NO_UNROLL
+                while (m_block < m_block_max) {
+                    bwd_step(m_block, local_mask_fn);
+                    ++m_block;
+                }
             }
         }
 
