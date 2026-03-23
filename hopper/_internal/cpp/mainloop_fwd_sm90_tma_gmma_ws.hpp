@@ -707,7 +707,11 @@ namespace flash
             // Consumer converts to natural log by multiplying by M_LN2.
             float const val0 = row_max(0) * row_max_scale_log2 + __log2f(row_sum_allreduced(0));
             float const val1 = row_max(1) * row_max_scale_log2 + __log2f(row_sum_allreduced(1));
-            streaming_store_f32x2(row_base + int64_t(n_block) * stride_N, val0, val1);
+            // row_max(0)/row_max(1) map to rows {row0, row0+8} in the GMMA C tile layout
+            // (standard Hopper GMMA SS fp16: two rows per thread separated by 8)
+            float* const base_n = row_base + int64_t(n_block) * stride_N;
+            streaming_store_f32(base_n,     val0);  // row: global_row0
+            streaming_store_f32(base_n + 8, val1);  // row: global_row0 + 8
         }
 
         // Main load function: responsible for loading Q, K, V data from global memory to shared memory
@@ -1240,7 +1244,7 @@ namespace flash
                 int const warp_in_wg = (thread_idx % 128) / 32;
                 int const lane       = thread_idx % 32;
                 int const group      = lane / kMmaThreadsPerRow_s;
-                int const row0       = wg_idx * 64 + warp_in_wg * 16 + group * 2;
+                int const row0       = wg_idx * 64 + warp_in_wg * 16 + group;
                 int const global_row0 = m_block * kBlockM + row0;
                 stats_stride_N = get<3>(params.stride_tile_stats);
                 stats_scale_log2 = !Is_INT8 ? softmax.softmax_scale_log2 : 1.0f;
@@ -1587,29 +1591,22 @@ namespace flash
                         // TODO: make the indexing clearning and faster!
                         int warp_id = thread_idx / 32;
                         int lane_id = thread_idx % 32;
-                        int address = warp_id * 64;
-                        // shared_storage.backlite_stats[address + lane_id] = softmax.row_sum(0);
-                        shared_storage.backlite_stats[address + lane_id] = def_d0;
-                        // shared_storage.backlite_stats[address + lane_id + 32] = softmax.row_sum(1);
-                        shared_storage.backlite_stats[address + lane_id + 32] = def_d1;
+                        int address = warp_id * 32 + lane_id;
+                        shared_storage.backlite_stats[address] = make_float2(def_d0, def_d1);
 
-                        /*
-                        the threads for which lane_id % 2 == 0 process row 0.
-                        and the threads for which lane_id % 2 == 1 process row 1.
-                        */
-                        // consider: reading float3 (stll writing float4, this way we can do vectorized float2 and regualr float load)
-                        float4* backlite_stats_ptr = reinterpret_cast<float4*>(shared_storage.backlite_stats);
-                        float4 elements = backlite_stats_ptr[warp_id * 16 + (lane_id / 4) + (lane_id % 2) * 8];
-                        float sum_val = elements.x + elements.y + elements.z + elements.w;
-                        float log_val = __log2f(sum_val);
-                        // float max_val = lane_id % 2 == 0 ? softmax.row_max(0) : softmax.row_max(1);
-                        float max_val = lane_id % 2 == 0 ? def_max0 : def_max1;
-                        float val = max_val * stats_scale_log2 + log_val;
-                        float* addr = stats_row_base + int64_t(def_tile_n) * stats_stride_N;
-                        if (lane_id % 4 < 2) {
-                            addr[lane_id % 4] = val;
+                        if ((lane_id & 0x3) == 0) {
+                            float4* backlite_stats_ptr = reinterpret_cast<float4*>(shared_storage.backlite_stats);
+                            int quad_idx = lane_id / 4;
+                            float4 elements0 = backlite_stats_ptr[warp_id * 16 + quad_idx * 2];
+                            float4 elements1 = backlite_stats_ptr[warp_id * 16 + quad_idx * 2 + 1];
+                            float sum0 = elements0.x + elements0.z + elements1.x + elements1.z;
+                            float sum1 = elements0.y + elements0.w + elements1.y + elements1.w;
+                            float* addr = stats_row_base + int64_t(def_tile_n) * stats_stride_N;
+                            float val0 = def_max0 * stats_scale_log2 + __log2f(sum0);
+                            float val1 = def_max1 * stats_scale_log2 + __log2f(sum1);
+                            streaming_store_f32(addr, val0);
+                            streaming_store_f32(addr + 8, val1);
                         }
-
                         // unsigned lane_d = thread_idx % 32;
                         // unsigned qmask_d = 0xFu << (lane_d & ~3u);
                         // def_d0 += __shfl_xor_sync(qmask_d, def_d0, 2);
@@ -1755,27 +1752,21 @@ namespace flash
                     // TODO: make the indexing clearning and faster!
                     int warp_id = thread_idx / 32;
                     int lane_id = thread_idx % 32;
-                    int address = warp_id * 64;
-                    // shared_storage.backlite_stats[address + lane_id] = softmax.row_sum(0);
-                    shared_storage.backlite_stats[address + lane_id] = def_d0;
-                    // shared_storage.backlite_stats[address + lane_id + 32] = softmax.row_sum(1);
-                    shared_storage.backlite_stats[address + lane_id + 32] = def_d1;
+                    int address = warp_id * 32 + lane_id;
+                    shared_storage.backlite_stats[address] = make_float2(def_d0, def_d1);
 
-                    /*
-                    the threads for which lane_id % 2 == 0 process row 0.
-                    and the threads for which lane_id % 2 == 1 process row 1.
-                    */
-                    // consider: reading float3 (stll writing float4, this way we can do vectorized float2 and regualr float load)
-                    float4* backlite_stats_ptr = reinterpret_cast<float4*>(shared_storage.backlite_stats);
-                    float4 elements = backlite_stats_ptr[warp_id * 16 + (lane_id / 4) + (lane_id % 2) * 8];
-                    float sum_val = elements.x + elements.y + elements.z + elements.w;
-                    float log_val = __log2f(sum_val);
-                    // float max_val = lane_id % 2 == 0 ? softmax.row_max(0) : softmax.row_max(1);
-                    float max_val = lane_id % 2 == 0 ? def_max0 : def_max1;
-                    float val = max_val * stats_scale_log2 + log_val;
-                    float* addr = stats_row_base + int64_t(def_tile_n) * stats_stride_N;
-                    if (lane_id % 4 < 2) {
-                        addr[lane_id % 4] = val;
+                    if ((lane_id & 0x3) == 0) {
+                        float4* backlite_stats_ptr = reinterpret_cast<float4*>(shared_storage.backlite_stats);
+                        int quad_idx = lane_id / 4;
+                        float4 elements0 = backlite_stats_ptr[warp_id * 16 + quad_idx * 2];
+                        float4 elements1 = backlite_stats_ptr[warp_id * 16 + quad_idx * 2 + 1];
+                        float sum0 = elements0.x + elements0.z + elements1.x + elements1.z;
+                        float sum1 = elements0.y + elements0.w + elements1.y + elements1.w;
+                        float* addr = stats_row_base + int64_t(def_tile_n) * stats_stride_N;
+                        float val0 = def_max0 * stats_scale_log2 + __log2f(sum0);
+                        float val1 = def_max1 * stats_scale_log2 + __log2f(sum1);
+                        streaming_store_f32(addr, val0);
+                        streaming_store_f32(addr + 8, val1);
                     }
 
                     // unsigned lane_d = thread_idx % 32;
