@@ -551,6 +551,40 @@ struct CollectiveMainloopBwdSm90 {
         }
     }
 
+    struct LocalSparseWordIterator {
+        Params const& params;
+        int bidb, bidh, n_block;
+        int m_block_max;
+        int next_m;
+
+        CUTLASS_DEVICE
+        LocalSparseWordIterator(Params const& params_, int bidb_, int bidh_, int n_block_, int m_block_min_, int m_block_max_)
+            : params(params_), bidb(bidb_), bidh(bidh_), n_block(n_block_), m_block_max(m_block_max_), next_m(m_block_min_) {
+            advance();
+        }
+
+        CUTLASS_DEVICE bool has_more() const {
+            return next_m < m_block_max;
+        }
+
+        CUTLASS_DEVICE int next_active() {
+            int ret = next_m;
+            ++next_m;
+            advance();
+            return ret;
+        }
+
+    private:
+        CUTLASS_DEVICE void advance() {
+            while (next_m < m_block_max) {
+                if (is_mask_block_active(params, bidb, bidh, n_block, next_m)) {
+                    return;
+                }
+                ++next_m;
+            }
+        }
+    };
+
     template <typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
     load(Params const& params,
@@ -659,84 +693,7 @@ struct CollectiveMainloopBwdSm90 {
 
         if (lane_predicate) {
             if (use_sparse_streaming) {
-                if constexpr (Is_local) {
-                    // For local window: bitmask has relative N indexing.
-                    // Different m_blocks map to different relative offsets, so we can't use
-                    // SparseWordIterator (which pre-loads one bitmask column). Instead, iterate
-                    // over [m_block_min, m_block_max) and check each m_block individually.
-                    // The pattern mirrors the SparseWordIterator path:
-                    //   1. Load Q/LSE for first active m_block, plus K/V
-                    //   2. For each subsequent active m_block: load dO for prev, then Q/LSE for current
-                    //   3. Load dO for last active m_block, then emit terminal stages
-                    int prev_active_m = -1;
-                    bool found_any = false;
-                    for (int m_blk = m_block_min; m_blk < m_block_max; ++m_blk) {
-                        if (!is_mask_block_active(params, bidb, bidh, n_block, m_blk)) { continue; }
-                        if (!found_any) {
-                            // First active m_block: load Q/LSE + K/V
-                            pipeline_q.producer_acquire(smem_pipe_write);
-                            shared_storage.q_tile_id[smem_pipe_write.index()] = m_blk;
-                            copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
-                                 tQgQ(_, m_blk), tQsQ(_, smem_pipe_write.index()));
-                            copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
-                                 gLSE(_, m_blk), sLSE(_, smem_pipe_write.index()));
-
-                            shared_storage.pipelines.barrier_KV.arrive_and_expect_tx(TmaTransactionBytesK + TmaTransactionBytesV);
-                            copy(params.tma_load_K.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0), tKgK, tKsK);
-                            copy(params.tma_load_V.with(reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_KV), 0), tVgV, tVsV);
-                            found_any = true;
-                        } else {
-                            // Subsequent active m_block: load dO for prev_active_m, then Q for current
-                            PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
-                            pipeline_do.producer_acquire(smem_pipe_write_do_cur);
-                            copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
-                                 tdOgdO(_, prev_active_m), tdOsdO(_, smem_pipe_write_do_cur.index()));
-                            copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
-                                 gdPsum(_, prev_active_m), sdPsum(_, smem_pipe_write_do_cur.index()));
-                            if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
-                            ++smem_pipe_write;
-
-                            pipeline_q.producer_acquire(smem_pipe_write);
-                            shared_storage.q_tile_id[smem_pipe_write.index()] = m_blk;
-                            copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
-                                 tQgQ(_, m_blk), tQsQ(_, smem_pipe_write.index()));
-                            copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
-                                 gLSE(_, m_blk), sLSE(_, smem_pipe_write.index()));
-                        }
-                        prev_active_m = m_blk;
-                    }
-                    if (!found_any) {
-                        // No active blocks — emit terminal stage
-                        PipelineState q_terminal_state = smem_pipe_write;
-                        pipeline_q.producer_acquire(q_terminal_state);
-                        complete_empty_q_stage(q_terminal_state);
-                        ++smem_pipe_write;
-                        PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(q_terminal_state, smem_pipe_write_do);
-                        pipeline_do.producer_acquire(smem_pipe_write_do_cur);
-                        complete_empty_do_stage(smem_pipe_write_do_cur);
-                        if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
-                    } else {
-                        // Emit dO for last active m_block, then terminal stages
-                        PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
-                        pipeline_do.producer_acquire(smem_pipe_write_do_cur);
-                        copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
-                             tdOgdO(_, prev_active_m), tdOsdO(_, smem_pipe_write_do_cur.index()));
-                        copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
-                             gdPsum(_, prev_active_m), sdPsum(_, smem_pipe_write_do_cur.index()));
-                        if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
-                        ++smem_pipe_write;
-
-                        PipelineState q_terminal_state = smem_pipe_write;
-                        pipeline_q.producer_acquire(q_terminal_state);
-                        complete_empty_q_stage(q_terminal_state);
-                        ++smem_pipe_write;
-                        PipelineState_dO smem_pipe_write_do_term = cute::conditional_return<Q_dO_same_stages>(q_terminal_state, smem_pipe_write_do);
-                        pipeline_do.producer_acquire(smem_pipe_write_do_term);
-                        complete_empty_do_stage(smem_pipe_write_do_term);
-                        if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
-                    }
-                } else {
-                    SparseWordIterator active(get_mask_ptr(params, bidb, bidh, n_block), params.num_row_tiles, m_block_min, m_block_max);
+                auto do_streaming = [&](auto& active) {
                     if (!active.has_more()) {
                         PipelineState q_terminal_state = smem_pipe_write;
                         pipeline_q.producer_acquire(q_terminal_state);
@@ -795,6 +752,14 @@ struct CollectiveMainloopBwdSm90 {
                         complete_empty_do_stage(smem_pipe_write_do_cur);
                         if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
                     }
+                };
+
+                if constexpr (Is_local) {
+                    LocalSparseWordIterator active(params, bidb, bidh, n_block, m_block_min, m_block_max);
+                    do_streaming(active);
+                } else {
+                    SparseWordIterator active(get_mask_ptr(params, bidb, bidh, n_block), params.num_row_tiles, m_block_min, m_block_max);
+                    do_streaming(active);
                 }
             } else {
                 int m_block = m_block_min;
