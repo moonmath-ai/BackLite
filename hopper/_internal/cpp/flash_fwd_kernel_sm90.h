@@ -151,8 +151,7 @@ namespace flash
                 alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
             } pipelines;
 
-            // float backlite_row_sum[2][NumMmaThreads];
-            alignas(sizeof(float4)) float backlite_stats[2 * NumMmaThreads];
+            alignas(sizeof(float4)) float2 backlite_stats[NumMmaThreads];
         };
 
         static constexpr int SharedStorageSize = sizeof(SharedStorage);

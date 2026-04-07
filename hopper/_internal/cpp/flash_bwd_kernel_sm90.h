@@ -84,7 +84,8 @@ public:
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
 
-        alignas(16) int compatition_m_blocks[32];
+        alignas(16) int q_tile_id[CollectiveMainloop::kStages];
+        alignas(16) int dq_tile_id[NumMmaWarpGroups];
 
     };
 
@@ -207,6 +208,16 @@ public:
         } else {
             __syncthreads();
         }
+
+        if (warp_idx == 0) {
+            if (threadIdx.x < CollectiveMainloop::kStages) {
+                shared_storage.q_tile_id[threadIdx.x] = -1;
+            }
+            if (threadIdx.x < NumMmaWarpGroups) {
+                shared_storage.dq_tile_id[threadIdx.x] = -1;
+            }
+        }
+        __syncthreads();
 
         TileScheduler scheduler(reinterpret_cast<typename TileScheduler::SharedStorage*>(&shared_storage.pipelines.smem_scheduler));
 
